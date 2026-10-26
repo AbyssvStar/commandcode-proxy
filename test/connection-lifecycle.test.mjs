@@ -146,6 +146,7 @@ test('启动横幅打出 keepAliveTimeout，便于与反代配置对齐', async 
       logs.split('\n').filter(l => l.includes('CC Proxy started')).join('\n'));
     assert.ok(logs.includes('反代侧 keepalive_timeout 必须小于它'),
       '必须提示反代侧的对应设置，否则这个值没有可操作性');
+    assert.match(logs, /idleTimeouts[":\s]+stream 300000ms \/ nonstream 90000ms/,
+      '流式读空闲默认值要覆盖推理模型的长暂停');
   } finally { await s.close(); }
 });
-

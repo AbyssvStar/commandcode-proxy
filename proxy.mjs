@@ -238,7 +238,7 @@ const MAX_BODY_SIZE = (() => {
 // 遇到推理模型被 30s 误杀 / 触发 429 重试放大时，调大这两个值即可。
 const STREAM_IDLE_TIMEOUT_MS = (() => {
   const ms = Number.parseInt(process.env.CC_STREAM_IDLE_MS ?? '', 10);
-  return Number.isFinite(ms) && ms > 0 ? ms : 30000;   // 默认 30s — 流式无新数据中断
+  return Number.isFinite(ms) && ms > 0 ? ms : 300000;  // 默认 5min — 推理模型可能长时间暂停输出
 })();
 const NONSTREAM_IDLE_TIMEOUT_MS = (() => {
   const ms = Number.parseInt(process.env.CC_NONSTREAM_IDLE_MS ?? '', 10);

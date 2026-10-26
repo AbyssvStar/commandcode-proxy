@@ -86,7 +86,7 @@ commandcode/
 | `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | 无 system prompt 时发空格占位；`false` 关掉 → `emptySystemPlaceholder` |
 | `CC_MAX_BODY_MB` | `100` | 请求体上限（MB），超限返回 `413` |
 | `CC_MAX_TOOL_IMAGE_MB` | `6` | 单请求内工具截图（base64）总预算，超预算的老图换成占位；`0` 关闭，见[工具截图预算](#工具截图预算) |
-| `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时，见[上游空闲超时](#上游空闲超时) |
+| `CC_STREAM_IDLE_MS` | `300000` | 流式上游读空闲超时，见[上游空闲超时](#上游空闲超时) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式上游读空闲超时（同上）|
 | `CC_UPSTREAM_RETRY_MAX` | `2` | 上游「未吐字前闪断」的内部重试次数；`0` = 关闭，见[上游闪断重试](#上游闪断重试) |
 | `CC_UPSTREAM_RETRY_BASE_MS` | `400` | 重试退避基数（毫秒），实际退避 = base × 尝试序号 |
@@ -592,7 +592,7 @@ CC_MAX_INFLIGHT=32 npm start    # 最多同时处理 32 个请求
 
 | 环境变量 | 默认 | 作用于 |
 |---|---|---|
-| `CC_STREAM_IDLE_MS` | `30000` | 流式请求 |
+| `CC_STREAM_IDLE_MS` | `300000` | 流式请求 |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式请求 |
 
 **语义**：只计「`reader.read()` 的等待时间」，每收到一个 chunk 就重置 —— **不是整个请求的总时长**。
@@ -600,10 +600,10 @@ CC_MAX_INFLIGHT=32 npm start    # 最多同时处理 32 个请求
 
 **默认值与官方 CLI 不一致，这是已知取舍**（[#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)）：
 官方 CLI 对上游**没有任何** idle timeout —— 反编译 `command-code@1.50.0` 可见所有 `createApiClient({ baseUrl })` 调用点都未传 `timeout`，实测 700+ 秒的停顿可正常完成。
-本代理保留 30s 是为了兜住真正死掉的连接；代价是**推理模型的长思考停顿可能被误杀**。
+本代理默认保留 5 分钟来兜住真正死掉的连接，同时减少误杀推理模型的长思考停顿；若仍需更长等待，可继续调大。
 
-若遇到「`429 Response timeout`」「`zero output tokens`」且日志里 `elapsedMs ≈ 30000`、`bytesReceived = 0`，
-说明是看门狗误杀了 prefill / 首 token 阶段的正常停顿 —— 调大即可：
+若遇到「`429 Response timeout`」且日志里 `timeoutMs` 等于当前配置、`lastCcEvent` 显示仍在 reasoning/text 阶段，
+说明上游在生成中停顿超过看门狗窗口；客户端收到 429 后可能自动重试，反复重发整个上下文。可按模型最长停顿调大：
 
 ```bash
 CC_STREAM_IDLE_MS=300000 npm start      # 5 分钟
@@ -706,7 +706,7 @@ location /v1/ {
     proxy_http_version 1.1;
     proxy_set_header Connection "";
     proxy_buffering off;
-    proxy_read_timeout 300s;   # 需大于 30s 的流空闲超时
+    proxy_read_timeout 360s;   # 需大于代理的 5min 流空闲超时
 }
 ```
 
