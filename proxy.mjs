@@ -8,7 +8,7 @@ import tls from 'tls';
 import { Readable } from 'stream';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
-import { readFileSync, existsSync, appendFileSync } from 'fs';
+import { readFileSync, existsSync, appendFileSync, writeFileSync, renameSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -32,6 +32,17 @@ function loadConfig() {
     deviceProjectDir: '', // 伪造的项目目录（留空则用内置的 C:\Users\dev\projects\app） // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
     upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
+    // 密钥池（可选）。mode="pool" 时忽略请求头里的 key，改用 keys.json 里的 key 轮换。
+    // 默认关闭 —— 不配这一块时行为与以前完全一致（key 仍来自请求头）。
+    keyPool: {
+      mode: 'off',               // off | pool
+      file: 'keys.json',         // 相对 proxy.mjs 所在目录；只放 key，不要提交
+      stateFile: 'keys.state.json', // 各 key 的用量/冷却状态（只存 hash，不存明文 key）
+      switchAtRatio: 0.95,       // 5h/周窗口用到这个比例就提前换 key（1 = 必须彻底耗尽才换）
+      probeIntervalMs: 600000,   // 只读探测额度，10 分钟一轮；冷却中的 key 不探测
+      maxAttempts: 3,            // 单次请求最多尝试几个 key（含首个）
+      adminToken: '',            // /admin/keys 的访问令牌；留空则关闭该接口
+    },
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -39,6 +50,10 @@ function loadConfig() {
     try {
       const user = JSON.parse(readFileSync(configPath, 'utf-8'));
       Object.assign(defaults, user);
+      // keyPool 是嵌套对象：整块覆盖会丢掉未写的字段，这里做一次浅合并
+      if (user.keyPool && typeof user.keyPool === 'object' && !Array.isArray(user.keyPool)) {
+        defaults.keyPool = Object.assign({}, defaults.keyPool, user.keyPool);
+      }
     } catch (e) {
       console.error('[config] Failed to parse config.json:', e.message);
     }
@@ -58,6 +73,10 @@ function loadConfig() {
   if (process.env.CC_CLI_SESSION_MODE) defaults.cliSessionMode = process.env.CC_CLI_SESSION_MODE;
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
   if (process.env.CC_UPSTREAM_PROXY) defaults.upstreamProxy = process.env.CC_UPSTREAM_PROXY;
+  if (process.env.CC_KEY_POOL_MODE) defaults.keyPool.mode = process.env.CC_KEY_POOL_MODE;
+  if (process.env.CC_KEY_POOL_FILE) defaults.keyPool.file = process.env.CC_KEY_POOL_FILE;
+  if (process.env.CC_KEY_POOL_STATE) defaults.keyPool.stateFile = process.env.CC_KEY_POOL_STATE;
+  if (process.env.CC_KEY_POOL_ADMIN_TOKEN) defaults.keyPool.adminToken = process.env.CC_KEY_POOL_ADMIN_TOKEN;
 
   return defaults;
 }
@@ -1340,6 +1359,252 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
 
   return response;
 }
+
+// ── 密钥池（可选）───────────────────────────────────
+// 背景：单个 user_ key 有 5h + 周两个额度窗口，用尽后上游返回 400（不是 402/429），
+// 客户端只能人工换 key。这里把「请求头里的一个 key」扩展成「一个池」：
+// 选一个可用 key、额度将尽/用尽时换下一个、全池耗尽时返回可重试的 429 而不是 400。
+//
+// 安全边界（比功能更重要，别为了「多跑一点」牺牲账号）：
+//   · 只有「当前 key 不可用」才换，绝不按请求轮询 —— 同一账号的会话与提示词缓存必须连续；
+//   · 每个 key 保留自己的设备指纹（generateFingerprint 由 key 派生），不共享、不统一身份；
+//   · 额度探测是只读 GET、串行、带抖动，冷却中的 key 完全不探测；
+//   · 日志与 HTTP 响应里不出现完整 key，只暴露 sha256 前 8 位（id）与 label。
+const POOL_CFG = (() => {
+  const raw = CFG.keyPool || {};
+  const mode = String(raw.mode || 'off').toLowerCase();
+  const ratio = Number(raw.switchAtRatio);
+  const interval = Number(raw.probeIntervalMs);
+  const attempts = Number.parseInt(raw.maxAttempts, 10);
+  return {
+    mode: mode === 'pool' ? 'pool' : 'off',
+    file: String(raw.file || 'keys.json'),
+    stateFile: String(raw.stateFile || 'keys.state.json'),
+    // 0.5~1：低于 0.5 等于用一半就换，浪费额度；1 = 必须彻底耗尽（会吃一次 400）
+    switchAtRatio: Number.isFinite(ratio) ? Math.min(1, Math.max(0.5, ratio)) : 0.95,
+    // 下限 500ms 只为测试；生产默认 10 分钟，别调得太激进
+    probeIntervalMs: Number.isFinite(interval) ? Math.min(3600000, Math.max(500, interval)) : 600000,
+    maxAttempts: Number.isFinite(attempts) ? Math.min(5, Math.max(1, attempts)) : 3,
+    adminToken: String(raw.adminToken || ''),
+  };
+})();
+
+function keyPoolId(apiKey) {
+  return crypto.createHash('sha256').update(apiKey).digest('hex').slice(0, 8);
+}
+
+// 只用于日志/管理接口：给人看的时间一律按本机时区格式化（resetAt 是 epoch ms）
+function fmtLocalTime(ms) {
+  if (!Number.isFinite(ms)) return null;
+  try { return new Date(ms).toLocaleString('zh-CN', { hour12: false }); }
+  catch { return new Date(ms).toISOString(); }
+}
+
+function emptyKeyState() {
+  return {
+    fiveHour: { used: null, cap: null, resetAt: null, exceeded: false },
+    weekly: { used: null, cap: null, resetAt: null, exceeded: false },
+    remainingCredits: null,
+    cooldownUntil: null,
+    cooldownReason: null,
+    lastProbeAt: null,
+    lastError: null,
+    authFailures: 0,
+  };
+}
+
+function createKeyPool(cfg) {
+  const pool = {
+    enabled: cfg.mode === 'pool',
+    entries: [],
+    activeId: null,
+    maxAttempts: cfg.maxAttempts,
+    switchAtRatio: cfg.switchAtRatio,
+    probeIntervalMs: cfg.probeIntervalMs,
+    inflight: new Map(),   // id → 在途 generate 数：探测避开在途请求，少一条可疑的并发额度查询
+    started: false,
+  };
+  if (!pool.enabled) return pool;
+
+  // ── keys.json ──
+  // 读不到就明确失败：静默退回「请求头 key」会让人以为池在生效，反而更难排查。
+  const keysPath = resolve(__dirname, cfg.file);
+  const statePath = resolve(__dirname, cfg.stateFile);
+  let doc;
+  try {
+    doc = JSON.parse(readFileSync(keysPath, 'utf-8'));
+  } catch (e) {
+    log('error', 'Key pool mode is on but keys file cannot be read; refusing to start', {
+      file: cfg.file, error: e.message,
+    });
+    process.exit(1);
+  }
+  const list = Array.isArray(doc) ? doc : (doc && Array.isArray(doc.keys) ? doc.keys : null);
+  if (!list || list.length === 0) {
+    log('error', 'Key pool file contains no keys; refusing to start', { file: cfg.file });
+    process.exit(1);
+  }
+
+  const seen = new Set();
+  list.forEach((item, idx) => {
+    const key = typeof item === 'string' ? item : (item && item.key);
+    if (typeof key !== 'string' || !/^user_[A-Za-z0-9_-]+$/.test(key)) {
+      log('error', 'Key pool entry is not a valid user_ key; refusing to start', {
+        index: idx, file: cfg.file,
+      });
+      process.exit(1);
+    }
+    if (seen.has(key)) {
+      log('warn', 'Duplicate key in pool ignored', { index: idx });
+      return;
+    }
+    seen.add(key);
+    pool.entries.push({
+      id: keyPoolId(key),
+      key,
+      label: (item && typeof item.label === 'string' && item.label) ? item.label : `key-${idx + 1}`,
+      priority: (item && Number.isFinite(item.priority)) ? item.priority : 100,
+      index: idx,
+      disabled: false,
+      state: emptyKeyState(),
+    });
+  });
+  if (pool.entries.length === 0) {
+    log('error', 'Key pool has no usable keys after dedupe; refusing to start', { file: cfg.file });
+    process.exit(1);
+  }
+
+  // ── 状态恢复（只恢复用量/冷却，不恢复 disabled —— 认证失败重启后允许再试）──
+  try {
+    const saved = JSON.parse(readFileSync(statePath, 'utf-8'));
+    if (saved && saved.version === 1) {
+      if (typeof saved.activeId === 'string') pool.activeId = saved.activeId;
+      for (const entry of pool.entries) {
+        const s = saved.keys && saved.keys[entry.id];
+        if (!s || typeof s !== 'object') continue;
+        for (const field of ['weekly', 'fiveHour']) {
+          const w = s[field];
+          if (w && typeof w === 'object') {
+            entry.state[field] = {
+              used: Number.isFinite(w.used) ? w.used : null,
+              cap: Number.isFinite(w.cap) ? w.cap : null,
+              resetAt: Number.isFinite(w.resetAt) ? w.resetAt : null,
+              exceeded: w.exceeded === true,
+            };
+          }
+        }
+        if (Number.isFinite(s.remainingCredits)) entry.state.remainingCredits = s.remainingCredits;
+        if (Number.isFinite(s.cooldownUntil)) entry.state.cooldownUntil = s.cooldownUntil;
+        if (typeof s.cooldownReason === 'string') entry.state.cooldownReason = s.cooldownReason;
+        if (Number.isFinite(s.lastProbeAt)) entry.state.lastProbeAt = s.lastProbeAt;
+      }
+      if (!pool.entries.some(e => e.id === pool.activeId)) pool.activeId = null;
+      log('info', 'Key pool state restored', { file: cfg.stateFile, keys: pool.entries.length });
+    }
+  } catch (e) {
+    if (e.code !== 'ENOENT') {
+      log('warn', 'Key pool state could not be restored (starting fresh)', { error: e.message });
+    }
+  }
+
+  // 状态写盘：合并 1s 内的多次变更，tmp + rename 原子替换；只写 hash，不写明文 key
+  let saveTimer = null;
+  const scheduleSave = () => {
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      try {
+        const out = { version: 1, activeId: pool.activeId, updatedAt: Date.now(), keys: {} };
+        for (const e of pool.entries) {
+          out.keys[e.id] = { label: e.label, priority: e.priority, ...e.state };
+        }
+        const tmp = statePath + '.tmp';
+        writeFileSync(tmp, JSON.stringify(out, null, 2), { encoding: 'utf-8', mode: 0o600 });
+        renameSync(tmp, statePath);
+      } catch (e) {
+        log('warn', 'Key pool state write failed', { error: e.message });
+      }
+    }, 1000);
+    saveTimer.unref?.();
+  };
+
+  // ── 选择：sticky（当前 key 一直用到不可用才换）──
+  // 不轮询的原因：换 key 会丢该账号的 prompt cache（首轮成本更高），
+  // 而且同一客户端短时间内反复换账号是最像「多人共用」的行为特征。
+  pool.select = (excludeIds) => {
+    const now = Date.now();
+    const available = pool.entries.filter((e) =>
+      !e.disabled
+      && !(e.state.cooldownUntil && e.state.cooldownUntil > now)
+      && !(excludeIds && excludeIds.has(e.id)));
+    if (available.length === 0) return null;
+
+    const current = available.find(e => e.id === pool.activeId);
+    if (current) return current;
+
+    available.sort((a, b) => (a.priority - b.priority) || (a.index - b.index));
+    const next = available[0];
+    const prev = pool.entries.find(e => e.id === pool.activeId);
+    if (prev) {
+      log('info', 'Key pool switched', { from: prev.label, to: next.label, fromId: prev.id, toId: next.id });
+    } else {
+      log('info', 'Key pool active key selected', { key: next.label, id: next.id });
+    }
+    pool.activeId = next.id;
+    scheduleSave();
+    return next;
+  };
+
+  pool.entryFor = (apiKey) => pool.entries.find(e => e.key === apiKey) || null;
+
+  pool.noteSuccess = (entry) => {
+    entry.state.authFailures = 0;
+    entry.state.lastError = null;
+  };
+
+  // 同一会话在不同 key 上必须是不同的 threadId：上游的 thread/缓存按账号隔离。
+  // 用 hash 确定性派生（同 key + 同 session 恒定），既保住该账号的缓存，又不把 A 的 thread 带到 B。
+  pool.threadIdFor = (apiKey, sessionId) => {
+    const h = crypto.createHash('sha256').update(`${apiKey}\0${sessionId}`).digest('hex');
+    return `${h.slice(0, 8)}-${h.slice(8, 12)}-5${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`;
+  };
+
+  // 全池不可用：给客户端一个「等一会儿再来」的语义，而不是上游那种 400。
+  // retry_after 必须封顶（周窗口 reset 可能是几天后，原样下发会让客户端长时间不重试）。
+  pool.exhausted = () => {
+    const now = Date.now();
+    const live = pool.entries.filter(e => !e.disabled);
+    let earliest = Infinity;
+    for (const e of live) {
+      if (e.state.cooldownUntil) earliest = Math.min(earliest, e.state.cooldownUntil);
+    }
+    const waitMs = Number.isFinite(earliest) ? Math.max(0, earliest - now) : 60000;
+    const retryAfter = Math.max(30, Math.min(300, Math.ceil(waitMs / 1000) || 60));
+    const when = Number.isFinite(earliest) ? fmtLocalTime(earliest) : 'unknown';
+    const message = live.length === 0
+      ? 'All API keys in the pool are disabled (authentication failures). Check keys.json.'
+      : `All API keys in the pool are over their usage limit. Earliest reset: ${when}.`;
+    return {
+      status: 429,
+      retryAfter,
+      body: {
+        error: { message, type: 'insufficient_quota', code: 'insufficient_quota' },
+        retry_after: retryAfter,
+      },
+    };
+  };
+
+  log('info', 'Key pool enabled', {
+    keys: pool.entries.length,
+    file: cfg.file,
+    switchAtRatio: cfg.switchAtRatio,
+    probeInterval: `${Math.round(cfg.probeIntervalMs / 1000)}s`,
+    maxAttempts: cfg.maxAttempts,
+  });
+  return pool;
+}
+
+const KEY_POOL = createKeyPool(POOL_CFG);
 
 // ── 路由 ────────────────────────────────────────────
 
