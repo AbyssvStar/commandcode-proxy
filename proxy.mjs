@@ -1002,7 +1002,26 @@ const CC_STATUS_MAP = {
   503: { status: 503, type: 'temporarily_unavailable' },
 };
 
-function mapCcError(ccStatus, ccBody) {
+// 额度耗尽的识别：上游用 400 表达「这个账号的周/5h 窗口用完了」，消息形如
+//   "You have insufficient credits to make this request."
+//   "weekly usage limit reached"
+// 不识别并改写的话，客户端只看到一个 invalid_request_error：既不退避，也不会换 key。
+const CC_QUOTA_RE = /insufficient[\s_-]+(?:credits?|balance|quota)|weekly\s+usage\s+limit|five[\s-]?hour\s+(?:usage\s+)?limit|usage_limit_reached|quota\s+(?:exceeded|reached)|free[\s_-]?usage[\s_-]?limit|go[\s_-]?usage[\s_-]?limit/i;
+
+function ccQuotaKind(status, message, code) {
+  const hit = `${message || ''} ${code || ''}`.match(CC_QUOTA_RE);
+  if (hit) {
+    if (/weekly/i.test(hit[0])) return 'weekly';
+    if (/five|hour/i.test(hit[0])) return 'fiveHour';
+    return 'credits';
+  }
+  if (code === 'USAGE_EXCEEDED') return 'credits';
+  // 402 本身就是额度/付费相关：没有可读消息时按余额处理
+  if (status === 402) return 'credits';
+  return null;
+}
+
+function mapCcError(ccStatus, ccBody, retryAfterOverride) {
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
   let message = `CC API error (${ccStatus})`;
   let code = null;
@@ -1019,6 +1038,24 @@ function mapCcError(ccStatus, ccBody) {
     }
   }
 
+  // 额度类错误（含 400/402/429）：统一成 429 insufficient_quota，并允许调用方指定
+  // 更精确的 retry_after（例如池里下一把 key 的额度恢复时间）。
+  const quotaKind = ccQuotaKind(ccStatus, message, code);
+  const retryAfter = Number.isFinite(retryAfterOverride)
+    ? Math.max(0, Math.ceil(retryAfterOverride))
+    : 30;
+  if (quotaKind) {
+    return {
+      status: 429,
+      code: 'insufficient_quota',
+      quotaKind,
+      body: {
+        error: { message, type: 'insufficient_quota', code: 'insufficient_quota' },
+        retry_after: retryAfter,
+      },
+    };
+  }
+
   // CC 429 响应可能带 retry-after
   if (ccStatus === 429) {
     return {
@@ -1026,7 +1063,7 @@ function mapCcError(ccStatus, ccBody) {
       code,
       body: {
         error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) },
-        retry_after: 30,
+        retry_after: retryAfter,
       },
     };
   }
@@ -1050,14 +1087,23 @@ function mapCcEventError(event) {
   const ccStatus = reportedStatus ?? 502;
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
 
-  // 与 mapCcError 保持一致：终态为 429 时带上 retry_after，
-  // 否则客户端 SDK 拿不到退避提示（402 也映射成 429，一视同仁）
-  if (mapped.status === 429) {
+  // 与 mapCcError 保持一致：额度耗尽 → 429 insufficient_quota，
+  // 其余终态 429 带 retry_after（402 也映射成 429，一视同仁）
+  const quotaKind = ccQuotaKind(ccStatus, message, code);
+  if (quotaKind || mapped.status === 429) {
     return {
       status: 429,
-      code,
+      code: quotaKind ? 'insufficient_quota' : code,
       reportedStatus,
-      body: { error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) }, retry_after: 30 },
+      quotaKind,
+      body: {
+        error: {
+          message,
+          type: quotaKind ? 'insufficient_quota' : 'rate_limit_error',
+          ...(quotaKind ? { code: 'insufficient_quota' } : (code ? { code } : {})),
+        },
+        retry_after: 30,
+      },
     };
   }
 
@@ -1322,7 +1368,10 @@ function upstreamFetch(urlStr, options) {
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
-  const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
+  const rawSessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
+  // 池模式下同一会话落到不同 key 上必须是不同 thread：账号之间不能共享 thread；
+  // 同一 key + 同一 session 的哈希是稳定的，所以该账号自己的缓存仍然保留。
+  const sessionId = KEY_POOL.enabled ? KEY_POOL.threadIdFor(apiKey, rawSessionId) : rawSessionId;
   // CLI 的 toWireThreadId：只有合法 UUID 才放进信封，否则整个键省略。
   // 同时按 CLI 的键顺序重排：config, memory, taste, skills, permissionMode, threadId, mode, params
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(sessionId))) {
@@ -1791,8 +1840,10 @@ function createKeyPool(cfg) {
       const t = setTimeout(tick, cfg.probeIntervalMs + jitter);
       t.unref?.();
     };
-    // 启动后 5~10s 再探：别和指纹/lifecycle 预请求挤在一起，也别在进程刚起来时发突兀的请求
-    const t0 = setTimeout(tick, 5000 + Math.floor(Math.random() * 5000));
+    // 启动后 5~10s 再探：别和指纹/lifecycle 预请求挤在一起，也别在进程刚起来时发突兀的请求。
+    // 首探延迟不超过一个探测周期，否则把 interval 调小（测试）也等不到首探。
+    const first = Math.min(5000 + Math.floor(Math.random() * 5000), cfg.probeIntervalMs);
+    const t0 = setTimeout(tick, first);
     t0.unref?.();
   };
 
@@ -1807,6 +1858,81 @@ function createKeyPool(cfg) {
 }
 
 const KEY_POOL = createKeyPool(POOL_CFG);
+
+// 请求用哪把 key：池关闭时沿用请求头里的 key（原行为），池开启时忽略请求头、由池决定
+// （Codex 里 experimental_bearer_token 填任意值即可，避免把真 key 写进客户端配置）。
+function pickRequestKey(headers) {
+  if (!KEY_POOL.enabled) return { apiKey: getApiKey(headers) };
+  const entry = KEY_POOL.select();
+  if (!entry) return { apiKey: null, exhausted: KEY_POOL.exhausted() };
+  return { apiKey: entry.key, entry };
+}
+
+// 上游语义里读出了额度耗尽：立刻给当前 key 打冷却，别等下一轮探测（最多 10 分钟）。
+function noteQuotaToPool(apiKey, mapped) {
+  if (!KEY_POOL.enabled || !mapped || !mapped.quotaKind) return;
+  const entry = KEY_POOL.entryFor(apiKey);
+  if (entry) KEY_POOL.markQuota(entry, mapped.quotaKind, 'stream');
+}
+
+// 一次「可能换 key 的上游请求」。只有还没向客户端写字节时才能换（响应体尚未消费），
+// 顺序：标记当前 key 不可用 → sticky 挑下一把 → 最多 maxAttempts 次。
+// 返回值二选一：{ response, apiKey, entry } 或 { error: { status, retryAfter, body } }。
+async function forwardWithPool({ body, apiKey, entry, incomingHeaders, signal, promptCacheKey }) {
+  if (!KEY_POOL.enabled) {
+    return { response: await forwardToCC(body, apiKey, incomingHeaders, signal, promptCacheKey) };
+  }
+  const excluded = new Set();
+  if (entry) excluded.add(entry.id);
+  let currentKey = apiKey;
+  let currentEntry = entry;
+  let attempts = 0;
+  const maxAttempts = Math.max(1, Math.min(KEY_POOL.maxAttempts, KEY_POOL.entries.length));
+
+  for (;;) {
+    attempts++;
+    // 每个 key 只初始化一次（ensureInitialized 内部有缓存，重复调用是 no-op）
+    await ensureInitialized(currentKey, signal);
+    const response = await forwardToCC(body, currentKey, incomingHeaders, signal, promptCacheKey);
+    if (response.ok) {
+      if (currentEntry) KEY_POOL.noteSuccess(currentEntry);
+      return { response, apiKey: currentKey, entry: currentEntry };
+    }
+
+    const text = await response.text().catch(() => '');
+    const mapped = mapCcError(response.status, text);
+    const quotaKind = mapped.quotaKind || null;
+    const authFail = response.status === 401 || response.status === 403;
+    log('error', 'CC API error', {
+      status: response.status,
+      code: mapped.code,
+      key: currentEntry?.label,
+      quotaKind,
+      body: summarizeUpstreamError(text),
+    });
+    if (currentEntry) {
+      if (quotaKind) KEY_POOL.markQuota(currentEntry, quotaKind, 'request');
+      else if (authFail) KEY_POOL.noteAuthFailure(currentEntry, response.status, 'request');
+    }
+
+    // 只有额度/认证问题值得换 key；参数错误、5xx 换了也一样
+    if ((!quotaKind && !authFail) || attempts >= maxAttempts) {
+      return { error: { status: mapped.status, retryAfter: mapped.body.retry_after ?? null, body: mapped.body } };
+    }
+    const next = KEY_POOL.select(excluded);
+    if (!next) {
+      const e = KEY_POOL.exhausted();
+      return { error: { status: e.status, retryAfter: e.retryAfter, body: e.body } };
+    }
+    log('info', 'Key pool retry with next key', {
+      from: currentEntry?.label, to: next.label,
+      reason: quotaKind || `http_${response.status}`, attempt: attempts,
+    });
+    currentKey = next.key;
+    currentEntry = next;
+    excluded.add(next.id);
+  }
+}
 
 // ── 路由 ────────────────────────────────────────────
 
@@ -1823,11 +1949,16 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
+  const keyPick = pickRequestKey(req.headers);
+  if (!keyPick.apiKey) {
+    if (keyPick.exhausted) {
+      sendJSON(res, keyPick.exhausted.status, keyPick.exhausted.body);
+      return;
+    }
     sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
   }
+  const apiKey = keyPick.apiKey;
 
   const stream = openaiReq.stream === true;
   const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
@@ -1885,16 +2016,24 @@ async function handleChatCompletions(req, res) {
   try {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
-    // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
+    // 转发到 CC API（传入客户端 headers，用于提取 session ID）。
+    // 池模式下这一层可能在「尚未写字节」时透明换 key。
+    const upstream = await forwardWithPool({
+      body: ccBody,
+      apiKey,
+      entry: keyPick.entry,
+      incomingHeaders: req.headers,
+      signal: abortController.signal,
+      promptCacheKey: openaiReq.prompt_cache_key,
+    });
 
-    if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
-      const mapped = mapCcError(ccResponse.status, errorText);
-      log('error', 'CC API error', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
-      sendJSON(res, mapped.status, mapped.body);
+    if (upstream.error) {
+      const e = upstream.error;
+      log('error', 'CC API error', { status: e.status, body: summarizeUpstreamError(JSON.stringify(e.body)) });
+      sendJSON(res, e.status, e.body);
       return;
     }
+    const ccResponse = upstream.response;
 
     // 下游断连检测：打断 CC 上游 + 记录日志（只在首次尝试注册，重试不重复挂载监听器）
     if (attempt === 1) res.on('close', () => {
@@ -2203,6 +2342,7 @@ async function handleChatCompletions(req, res) {
       processLines();
 
       if (upstreamError) {
+        noteQuotaToPool(apiKey, upstreamError);
         sendJSON(res, upstreamError.status, upstreamError.body);
         return;
       }
@@ -2832,11 +2972,17 @@ async function handleMessages(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
+  const keyPick = pickRequestKey(req.headers);
+  if (!keyPick.apiKey) {
+    if (keyPick.exhausted) {
+      const e = keyPick.exhausted;
+      sendAnthropicError(res, e.status, e.body.error.type, e.body.error.message, e.retryAfter);
+      return;
+    }
     sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
     return;
   }
+  const apiKey = keyPick.apiKey;
 
   const stream = anthropicReq.stream === true;
   const model = anthropicReq.model || 'claude-sonnet-4-6';
@@ -2856,15 +3002,21 @@ async function handleMessages(req, res) {
   try {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    const upstream = await forwardWithPool({
+      body: ccBody,
+      apiKey,
+      entry: keyPick.entry,
+      incomingHeaders: req.headers,
+      signal: abortController.signal,
+    });
 
-    if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
-      const mapped = mapCcError(ccResponse.status, errorText);
-      log('error', 'CC API error (Anthropic)', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
-      sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
+    if (upstream.error) {
+      const e = upstream.error;
+      log('error', 'CC API error (Anthropic)', { status: e.status, body: summarizeUpstreamError(JSON.stringify(e.body)) });
+      sendAnthropicError(res, e.status, e.body.error?.type || 'upstream_error', e.body.error?.message || 'Upstream error', e.retryAfter ?? e.body.retry_after);
       return;
     }
+    const ccResponse = upstream.response;
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
@@ -2949,6 +3101,7 @@ async function handleMessages(req, res) {
         if (!aborted) {
           consecutiveTimeouts = 0;
           if (ctx.upstreamError) {
+            noteQuotaToPool(apiKey, ctx.upstreamError);
             if (!started) {
               sendAnthropicError(
                 res,
@@ -3108,6 +3261,7 @@ async function handleMessages(req, res) {
       processLines();
 
       if (upstreamError) {
+        noteQuotaToPool(apiKey, upstreamError);
         sendAnthropicError(res, upstreamError.status, upstreamError.body.error.type, upstreamError.body.error.message);
         return;
       }
@@ -3779,12 +3933,18 @@ async function handleResponses(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
+  const keyPick = pickRequestKey(req.headers);
+  if (!keyPick.apiKey) {
+    if (keyPick.exhausted) {
+      const e = keyPick.exhausted;
+      sendResponsesError(res, e.status, e.body.error.type, e.body.error.message, e.retryAfter);
+      return;
+    }
     sendResponsesError(res, 401, 'authentication_error',
       'Missing API key. Send in Authorization: Bearer <key> or x-api-key header');
     return;
   }
+  const apiKey = keyPick.apiKey;
 
   let chatReq = convertResponsesToChat(respReq);
   if (!chatReq.messages.length) {
@@ -3829,15 +3989,22 @@ async function handleResponses(req, res) {
 
   try {
     await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
+    const upstream = await forwardWithPool({
+      body: ccBody,
+      apiKey,
+      entry: keyPick.entry,
+      incomingHeaders: req.headers,
+      signal: abortController.signal,
+      promptCacheKey,
+    });
 
-    if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
-      const mapped = mapCcError(ccResponse.status, errorText);
-      log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses', code: mapped.code, body: summarizeUpstreamError(errorText) });
-      sendResponsesError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, mapped.body.retry_after);
+    if (upstream.error) {
+      const e = upstream.error;
+      log('error', 'CC API error', { status: e.status, path: '/v1/responses', body: summarizeUpstreamError(JSON.stringify(e.body)) });
+      sendResponsesError(res, e.status, e.body.error?.type || 'upstream_error', e.body.error?.message || 'Upstream error', e.retryAfter ?? e.body.retry_after);
       return;
     }
+    const ccResponse = upstream.response;
 
     if (stream) {
       translator = createResponsesSseTranslator(model, responseId, created);
@@ -3906,6 +4073,7 @@ async function handleResponses(req, res) {
             if (evts) await writeEvents(evts);
           }
           if (translator.upstreamError) {
+            noteQuotaToPool(apiKey, translator.upstreamError);
             if (!started) {
               sendResponsesError(res, translator.upstreamError.status,
                 translator.upstreamError.body.error.type, translator.upstreamError.body.error.message,
@@ -4046,6 +4214,7 @@ async function handleResponses(req, res) {
       processLines();
 
       if (upstreamError) {
+        noteQuotaToPool(apiKey, upstreamError);
         sendResponsesError(res, upstreamError.status, upstreamError.body.error.type,
           upstreamError.body.error.message, upstreamError.body.retry_after);
         return;
@@ -4088,7 +4257,9 @@ async function handleResponses(req, res) {
 }
 
 async function handleModels(req, res) {
-  const apiKey = getApiKey(req.headers);
+  // 池模式下列表请求也要带一把可用 key；全池冷却时退回内置列表，不报错
+  const keyPick = pickRequestKey(req.headers);
+  const apiKey = keyPick.apiKey;
   const models = await fetchModels(apiKey);
   const now = nowUnix();
   sendJSON(res, 200, {
