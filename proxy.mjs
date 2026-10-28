@@ -1400,6 +1400,61 @@ function fmtLocalTime(ms) {
   catch { return new Date(ms).toISOString(); }
 }
 
+function numOrNull(v) {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+function parseQuotaWindow(w) {
+  const o = (w && typeof w === 'object') ? w : {};
+  return {
+    used: numOrNull(o.used),
+    cap: numOrNull(o.cap),
+    resetAt: numOrNull(o.resetAt),
+    exceeded: o.exceeded === true,
+  };
+}
+
+// 解析 /alpha/billing/credits 的响应。该端点非官方文档，字段缺失时一律回 null（不猜），
+// 判定逻辑只依赖 weekly/fiveHour/credits 三组数值。
+function parseCreditsPayload(data) {
+  if (!data || typeof data !== 'object') return null;
+  const credits = (data.credits && typeof data.credits === 'object') ? data.credits : {};
+  const wl = (data.windowLimits && typeof data.windowLimits === 'object') ? data.windowLimits : {};
+  const monthly = numOrNull(credits.monthlyCredits);
+  const purchased = numOrNull(credits.purchasedCredits);
+  const free = numOrNull(credits.freeCredits);
+  const remaining = (monthly === null && purchased === null && free === null)
+    ? null
+    : (monthly || 0) + (purchased || 0) + (free || 0);
+  return {
+    weekly: parseQuotaWindow(wl.weekly),
+    fiveHour: parseQuotaWindow(wl.fiveHour),
+    remainingCredits: remaining,
+    // limited:true 在健康时也为 true，只做展示，绝不能拿它当「已耗尽」
+    limited: wl.limited === true,
+  };
+}
+
+// 哪个窗口先撑不住？两个窗口同时耗尽时取恢复更晚的那个（周窗口通常是瓶颈）。
+function decideQuotaCooldown(state, ratio) {
+  const now = Date.now();
+  const over = (w) => w && w.cap !== null && w.cap > 0
+    && (w.exceeded || (w.used !== null && w.used >= w.cap * ratio));
+  const hits = [];
+  if (over(state.weekly)) {
+    hits.push({ reason: 'weekly_limit', until: (state.weekly.resetAt && state.weekly.resetAt > now) ? state.weekly.resetAt : now + 600000 });
+  }
+  if (over(state.fiveHour)) {
+    hits.push({ reason: 'five_hour_limit', until: (state.fiveHour.resetAt && state.fiveHour.resetAt > now) ? state.fiveHour.resetAt : now + 600000 });
+  }
+  if (state.remainingCredits !== null && state.remainingCredits <= 0.001) {
+    // 余额耗尽没有可靠的恢复时间（可能随订阅周期/补充购买恢复），保守地 3h 后再探测
+    hits.push({ reason: 'credits_exhausted', until: now + 3 * 60 * 60 * 1000 });
+  }
+  if (hits.length === 0) return null;
+  return hits.reduce((a, b) => (b.until > a.until ? b : a));
+}
+
 function emptyKeyState() {
   return {
     fiveHour: { used: null, cap: null, resetAt: null, exceeded: false },
@@ -1592,6 +1647,153 @@ function createKeyPool(cfg) {
         retry_after: retryAfter,
       },
     };
+  };
+
+  // ── 冷却与探测 ──
+  const QUOTA_RETRY_MS = 10 * 60 * 1000;          // 只知道「超额」但没有 resetAt 时的保守冷却
+  const CREDITS_RETRY_MS = 3 * 60 * 60 * 1000;    // 余额耗尽：3h 后重新探测
+  const AUTH_RETRY_MS = 5 * 60 * 1000;
+
+  const markCooldown = (entry, until, reason, source) => {
+    const now = Date.now();
+    const next = Math.max(until || 0, now + 60 * 1000); // 至少 1 分钟，避免同一请求内反复撞同一把 key
+    const changed = entry.state.cooldownUntil !== next || entry.state.cooldownReason !== reason;
+    entry.state.cooldownUntil = next;
+    entry.state.cooldownReason = reason;
+    if (pool.activeId === entry.id) pool.activeId = null; // 下一次 select 重新挑
+    if (changed) {
+      log('warn', 'Key pool cooled down', {
+        key: entry.label, id: entry.id, reason, source, until: fmtLocalTime(next),
+      });
+    }
+    scheduleSave();
+  };
+
+  pool.markQuota = (entry, kind, source) => {
+    const now = Date.now();
+    const win = kind === 'weekly' ? entry.state.weekly : kind === 'fiveHour' ? entry.state.fiveHour : null;
+    const reason = kind === 'weekly' ? 'weekly_limit' : kind === 'fiveHour' ? 'five_hour_limit' : 'credits_exhausted';
+    const until = (win && win.resetAt && win.resetAt > now)
+      ? win.resetAt
+      : (kind === 'credits' ? now + CREDITS_RETRY_MS : now + QUOTA_RETRY_MS);
+    markCooldown(entry, until, reason, source);
+  };
+
+  // 401/403：先短冷却再试一次，连续两次才禁用（避免一次上游抖动就把 key 永久踢掉）
+  pool.noteAuthFailure = (entry, status, source) => {
+    entry.state.authFailures = (entry.state.authFailures || 0) + 1;
+    entry.state.lastError = { status, at: Date.now(), source };
+    if (entry.state.authFailures >= 2) {
+      entry.disabled = true;
+      log('error', 'Key disabled after repeated auth failures', {
+        key: entry.label, id: entry.id, status, source,
+      });
+      if (pool.activeId === entry.id) pool.activeId = null;
+    } else {
+      markCooldown(entry, Date.now() + AUTH_RETRY_MS, 'auth_failed', source);
+    }
+    scheduleSave();
+  };
+
+  pool.applyProbe = (entry, parsed, source) => {
+    entry.state.weekly = parsed.weekly;
+    entry.state.fiveHour = parsed.fiveHour;
+    entry.state.remainingCredits = parsed.remainingCredits;
+    entry.state.lastProbeAt = Date.now();
+    const hit = decideQuotaCooldown(entry.state, cfg.switchAtRatio);
+    if (hit) {
+      markCooldown(entry, hit.until, hit.reason, source);
+    } else if (['weekly_limit', 'five_hour_limit', 'credits_exhausted'].includes(entry.state.cooldownReason)) {
+      // 探测显示额度回来了：解除「额度类」冷却。auth_failed 等其他冷却不在此清除。
+      entry.state.cooldownUntil = null;
+      entry.state.cooldownReason = null;
+      log('info', 'Key pool quota recovered', { key: entry.label, id: entry.id });
+      scheduleSave();
+    } else {
+      scheduleSave();
+    }
+  };
+
+  pool.beginRequest = (id) => {
+    pool.inflight.set(id, (pool.inflight.get(id) || 0) + 1);
+  };
+  pool.endRequest = (id) => {
+    const n = (pool.inflight.get(id) || 0) - 1;
+    if (n > 0) pool.inflight.set(id, n);
+    else pool.inflight.delete(id);
+  };
+
+  // 只读探测一个 key 的额度。失败不影响请求路径，下一轮再试。
+  pool.probeOne = async (entry) => {
+    let res;
+    try {
+      res = await upstreamFetch(`${CFG.apiBase}/alpha/billing/credits`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${entry.key}`,
+          'x-cli-environment': 'production',
+          'x-command-code-version': CC_VERSION,
+          'User-Agent': 'cli',
+          'Accept': 'application/json',
+        },
+        signal: AbortSignal.timeout(15000),
+      });
+    } catch (e) {
+      log('warn', 'Quota probe failed, will retry next round', { key: entry.label, id: entry.id, error: e.message });
+      return { ok: false, error: e.message };
+    }
+    if (res.status === 401 || res.status === 403) {
+      pool.noteAuthFailure(entry, res.status, 'probe');
+      return { ok: false, status: res.status };
+    }
+    if (!res.ok) {
+      log('warn', 'Quota probe returned non-OK, will retry next round', {
+        key: entry.label, id: entry.id, status: res.status,
+      });
+      return { ok: false, status: res.status };
+    }
+    const parsed = parseCreditsPayload(await res.json().catch(() => null));
+    if (!parsed) {
+      log('warn', 'Quota probe payload unrecognized (endpoint may have changed)', { key: entry.label, id: entry.id });
+      return { ok: false, error: 'unrecognized payload' };
+    }
+    pool.applyProbe(entry, parsed, 'probe');
+    log('info', 'Quota probe', {
+      key: entry.label,
+      id: entry.id,
+      weekly: `${parsed.weekly.used ?? '?'}/${parsed.weekly.cap ?? '?'}`,
+      fiveHour: `${parsed.fiveHour.used ?? '?'}/${parsed.fiveHour.cap ?? '?'}`,
+      credits: parsed.remainingCredits,
+    });
+    return { ok: true, parsed };
+  };
+
+  // 一轮探测：跳过冷却中与在途的 key，串行 + 抖动（不制造并发额度查询）
+  pool.probeRound = async () => {
+    const now = Date.now();
+    const due = pool.entries.filter((e) => !e.disabled
+      && !(e.state.cooldownUntil && e.state.cooldownUntil > now)
+      && !((pool.inflight.get(e.id) || 0) > 0));
+    for (const entry of due) {
+      if (pool.stopping) return;
+      await pool.probeOne(entry);
+      await sleep(400 + Math.floor(Math.random() * 900));
+    }
+  };
+
+  pool.start = () => {
+    if (pool.started) return;
+    pool.started = true;
+    const tick = async () => {
+      try { await pool.probeRound(); }
+      catch (e) { log('warn', 'Quota probe round failed', { error: e.message }); }
+      const jitter = Math.floor(cfg.probeIntervalMs * 0.2 * Math.random());
+      const t = setTimeout(tick, cfg.probeIntervalMs + jitter);
+      t.unref?.();
+    };
+    // 启动后 5~10s 再探：别和指纹/lifecycle 预请求挤在一起，也别在进程刚起来时发突兀的请求
+    const t0 = setTimeout(tick, 5000 + Math.floor(Math.random() * 5000));
+    t0.unref?.();
   };
 
   log('info', 'Key pool enabled', {
@@ -4015,6 +4217,9 @@ server.listen(CFG.port, CFG.host, () => {
     upstreamRetry: UPSTREAM_RETRY_MAX > 0
       ? `${UPSTREAM_RETRY_MAX} retries, base ${UPSTREAM_RETRY_BASE_MS}ms (only before first byte)`
       : 'disabled (CC_UPSTREAM_RETRY_MAX=0)',
+    keyPool: KEY_POOL.enabled
+      ? `${KEY_POOL.entries.length} keys, sticky, switch at ${Math.round(KEY_POOL.switchAtRatio * 100)}%, probe every ${Math.round(KEY_POOL.probeIntervalMs / 60000)}min`
+      : 'off',
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });
@@ -4029,7 +4234,9 @@ server.listen(CFG.port, CFG.host, () => {
       hint: 'lower CC_MAX_BODY_MB, set CC_MAX_INFLIGHT, and/or cap in-flight requests at the reverse proxy (see README)',
     });
   }
-  if (!CFG.apiKey) {
+  if (KEY_POOL.enabled) {
+    KEY_POOL.start();
+  } else if (!CFG.apiKey) {
     log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
   }
 });
