@@ -31,6 +31,7 @@ curl http://127.0.0.1:3050/v1/chat/completions \
 ```
 commandcode/
 ├── config.json           # 端口 / 日志路径等
+├── keys.example.json     # 密钥池示例（复制为 keys.json 后填真 key）
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
 ├── proxy.mjs             # 单文件核心代理（~1900 行）
@@ -66,6 +67,7 @@ commandcode/
 | `fingerprintSalt` | `""` | 设备指纹的盐。**成批换设备身份**就用它（同一个 key 永远报同一台设备）|
 | `deviceProjectDir` | `""` | 伪装的项目目录（空则用内置 `C:\Users\dev\projects\app`）；改了 = 所有账号换一台设备 |
 | `emptySystemPlaceholder` | `true` | 无 system prompt 时发空格占位，阻止上游注入约 7.5K token 默认提示词（[#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)）|
+| `keyPool` | `{"mode":"off"}` | 密钥池：`mode` / `file` / `stateFile` / `switchAtRatio` / `probeIntervalMs` / `maxAttempts` / `adminToken`，见[密钥池](#密钥池多-key-轮换) |
 
 ### 环境变量
 
@@ -93,6 +95,10 @@ commandcode/
 | `CC_MAX_INFLIGHT` | `0`（不限）| 进程内在途请求上限，超限 `503`，见[在途上限](#在途请求上限可选) |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数就断开该客户端，见[僵死连接](#僵死连接既不读也不断开) |
 | `CC_KEEPALIVE_TIMEOUT_MS` | `65000` | 后端 keep-alive 时长（`headersTimeout` 自动 +1s）。**必须大于反代侧的 keepalive_timeout**，见 [keep-alive 时序](#nginx-反代建议) |
+| `CC_KEY_POOL_MODE` | `off` | `pool` 开启密钥池，见[密钥池](#密钥池多-key-轮换) → `keyPool.mode` |
+| `CC_KEY_POOL_FILE` | `keys.json` | key 列表路径 → `keyPool.file` |
+| `CC_KEY_POOL_STATE` | `keys.state.json` | 状态文件路径 → `keyPool.stateFile` |
+| `CC_KEY_POOL_ADMIN_TOKEN` | 空 | `/admin/keys` 的管理 token；留空 = 不暴露该路由 → `keyPool.adminToken` |
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
@@ -101,6 +107,66 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 **请求体上限**：独立于 `config.json` —— 超过 **100MB** 的请求会被拒绝并返回 `HTTP 413`（连接保持可排空，不会直接 reset）。可用 `CC_MAX_BODY_MB`（正整数，单位 MB）覆盖。
 
 > ⚠️ **内存放大**：请求体在转发到上游前会存在多份副本，实测峰值 ≈ body 大小 × **5.1~7.4**（7MB→+52MB、20MB→+116MB；被 `413` 拒绝的请求只要 ×1.05）。因此默认 `CC_MAX_BODY_MB=100` 意味着**单个请求**最坏可吃 ~550MB，且该上限是每请求的、不是全局的。详见[内存与部署](#内存与部署)。
+
+### 密钥池（多 key 轮换）
+
+默认关闭：进程只转发「请求头里带来的那把 key」。打开后代理自己持有 N 把 key，
+按「同一把用到底、额度将尽才换」的粘性策略选 key，客户端不需要改。
+
+**开启**（二选一）
+
+- `config.json`：`"keyPool": { "mode": "pool" }`
+- 或环境变量 `CC_KEY_POOL_MODE=pool`
+
+**keys.json**（默认与 `proxy.mjs` 同目录，`keyPool.file` 可改；参考 `keys.example.json`）
+
+```json
+[
+  { "key": "user_xxx", "label": "主号" },
+  { "key": "user_yyy", "label": "备号", "priority": 10 }
+]
+```
+
+`priority` 越小越优先（默认 100），`label` 只用于日志和管理视图。key 必须是 `user_` 开头；
+重复 key 会被忽略。读不到文件或一个有效 key 都没有时**启动即报错退出**——宁可明确失败，
+也不会悄悄退回「只认请求头」的模式。
+
+**行为**
+
+- **选 key**：粘性。当前 key 一直用到不可用才换，不按请求轮询（换 key 会丢该账号的 prompt cache，
+  也最像多人共用同一份额度）。
+- **提前换**：只读探测 `/alpha/billing/credits`（默认 10 分钟一轮，不消耗额度）。周窗口或 5h 窗口
+  用量达到 `switchAtRatio`（默认 0.95）就冷却到该窗口的 `resetAt`；额度余额见底冷却 3 小时。
+- **用完再换**：上游把额度耗尽表达成 **HTTP 400**（`weekly usage limit reached` /
+  `insufficient credits`），代理识别后改写成 **429 `insufficient_quota`**；如果此时还没向客户端
+  写过任何字节，就在同一个客户端请求内**透明换下一把 key 重试**（最多 `maxAttempts` 次，默认 3）。
+- **401/403**：同一次请求内换 key；同一把 key 连续两次 401/403 才禁用（只在内存里，重启恢复）。
+- **全池冷却**：返回 `429 insufficient_quota`，`retry_after` 取最早恢复时间并封顶 300s，
+  不会再把你踢回上游的 400。
+- **状态**：`keys.state.json` 只存每把 key 的 sha256 前 8 位与用量/冷却，原子写入、权限 0600。
+
+**Codex 侧**：`~/.codex/config.toml` 里 `experimental_bearer_token` 填任意非空值即可
+（池模式忽略它，但 Codex 仍要求非空）：
+
+```toml
+[model_providers.commandcode]
+base_url = "http://127.0.0.1:3050/v1"
+wire_api = "responses"
+experimental_bearer_token = "user_pool"   # 占位；真正的 key 在 keys.json
+```
+
+**管理视图**：配置 `keyPool.adminToken`（或 `CC_KEY_POOL_ADMIN_TOKEN`）后才有
+`GET /admin/keys`，用 `x-admin-token` 头或 `?token=` 访问；没配置时该路由直接 404。
+返回每把 key 的 label、冷却原因与截止时间（本机时间）、周/5h 用量、剩余额度、在途请求数，
+**只回显 hash 前缀，不含明文 key**。
+
+**注意**
+
+- 已经开始向客户端输出字节的响应不会换 key（会重复/截断输出），只在可安全重放时换。
+- 换 key 后同一会话的 threadId 会变（避免把 A 的 thread 带到 B），代价是该账号没有之前的缓存。
+- 探测端点不是官方文档接口，字段缺失时代理只告警、不猜；额度判断始终看 `exceeded` 和
+  `used >= cap`（健康账号的 `limited` 也是 `true`）。
+- 多进程/多实例不要共享同一个 `keys.state.json`（没有跨进程锁）。
 
 ### 工具截图预算
 

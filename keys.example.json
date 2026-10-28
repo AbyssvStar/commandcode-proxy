@@ -1,0 +1,4 @@
+[
+  { "key": "user_replace_me_1", "label": "main" },
+  { "key": "user_replace_me_2", "label": "backup", "priority": 10 }
+]

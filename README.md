@@ -31,6 +31,7 @@ curl http://127.0.0.1:3050/v1/chat/completions \
 ```
 commandcode/
 ├── config.json           # Port / log path etc.
+├── keys.example.json     # Key-pool sample (copy to keys.json and fill in real keys)
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
 ├── proxy.mjs             # Single-file proxy core (~1900 lines)
@@ -66,6 +67,7 @@ commandcode/
 | `fingerprintSalt` | `""` | Salt for the device fingerprint — use it to rotate the whole fleet's identity (one key still always reports one device) |
 | `deviceProjectDir` | `""` | Faked project directory (empty = built-in `C:\Users\dev\projects\app`); changing it gives every account a different device |
 | `emptySystemPlaceholder` | `true` | Send a space placeholder when there is no system prompt, preventing upstream from injecting its ~7.5K-token default ([#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)) |
+| `keyPool` | `{"mode":"off"}` | Key pool: `mode` / `file` / `stateFile` / `switchAtRatio` / `probeIntervalMs` / `maxAttempts` / `adminToken`; see [Key pool](#key-pool-multiple-api-keys) |
 
 ### Environment Variables
 
@@ -93,6 +95,10 @@ commandcode/
 | `CC_MAX_INFLIGHT` | `0` (unlimited) | In-process request cap; over-limit returns `503`; see [In-flight cap](#in-flight-cap-optional) |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | unset (disabled) | Drop the client once downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
 | `CC_KEEPALIVE_TIMEOUT_MS` | `65000` | Backend keep-alive timeout (`headersTimeout` is set to +1s automatically). **Must be larger than the reverse proxy's keepalive_timeout** — see [keep-alive ordering](#suggested-nginx-front) |
+| `CC_KEY_POOL_MODE` | `off` | `pool` enables the key pool; see [Key pool](#key-pool-multiple-api-keys) → `keyPool.mode` |
+| `CC_KEY_POOL_FILE` | `keys.json` | Key list path → `keyPool.file` |
+| `CC_KEY_POOL_STATE` | `keys.state.json` | State file path → `keyPool.stateFile` |
+| `CC_KEY_POOL_ADMIN_TOKEN` | unset | Admin token for `/admin/keys`; unset = the route does not exist → `keyPool.adminToken` |
 
 When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
 and the fingerprint/lifecycle initialization requests. It does not add the header
@@ -103,6 +109,72 @@ authority for actual retention and provider availability.
 **Request body limit**: independent of `config.json` — requests larger than **100 MB** are rejected with `HTTP 413` (the connection is kept alive and drained, not reset). Override with `CC_MAX_BODY_MB` (positive integer, unit: MB).
 
 > ⚠️ **Memory amplification**: a request body exists in several copies before it reaches upstream; measured peak ≈ body size × **5.1–7.4** (7 MB → +52 MB, 20 MB → +116 MB, while a request rejected with `413` costs only ×1.05). The default `CC_MAX_BODY_MB=100` therefore implies up to ~550 MB for a **single** request, and that limit is per-request, not global. See [Memory & Deployment](#memory--deployment).
+
+### Key pool (multiple API keys)
+
+Off by default: the process forwards whatever key the request carries. When enabled, the proxy
+holds N keys itself and picks one with a sticky strategy — keep using the same key until it is
+unusable, then move on. The client does not change.
+
+**Enable** (either)
+
+- `config.json`: `"keyPool": { "mode": "pool" }`
+- or `CC_KEY_POOL_MODE=pool`
+
+**keys.json** (next to `proxy.mjs` by default, override with `keyPool.file`; see `keys.example.json`)
+
+```json
+[
+  { "key": "user_xxx", "label": "main" },
+  { "key": "user_yyy", "label": "backup", "priority": 10 }
+]
+```
+
+Lower `priority` wins (default 100); `label` only shows up in logs and the admin view. Keys must
+start with `user_`; duplicates are ignored. A missing file or zero valid keys is a **fatal startup
+error** — the proxy fails loudly rather than silently falling back to header-only mode.
+
+**Behavior**
+
+- **Selection**: sticky. A key is used until it becomes unusable; no per-request round-robin
+  (switching loses that account's prompt cache and looks like quota sharing).
+- **Early switch**: a read-only probe of `/alpha/billing/credits` runs every 10 minutes and spends
+  no quota. Once the weekly or 5-hour window reaches `switchAtRatio` (default 0.95) the key is cooled
+  down until that window's `resetAt`; an exhausted credit balance cools it down for 3 hours.
+- **On exhaustion**: upstream reports quota exhaustion as **HTTP 400** (`weekly usage limit reached` /
+  `insufficient credits`). The proxy rewrites it to **429 `insufficient_quota`**, and — if no byte has
+  been written to the client yet — transparently retries the same request on the next key (up to
+  `maxAttempts`, default 3).
+- **401/403**: retried on the next key within the same request; a key is only disabled after two
+  consecutive auth failures (in memory only, reset on restart).
+- **Whole pool exhausted**: `429 insufficient_quota` with `retry_after` set to the earliest recovery
+  time, capped at 300s — never the raw upstream 400.
+- **State**: `keys.state.json` stores only the first 8 hex chars of each key's sha256 plus usage and
+  cooldowns; written atomically with mode 0600.
+
+**Codex**: any non-empty `experimental_bearer_token` works — pool mode ignores it, but Codex requires it:
+
+```toml
+[model_providers.commandcode]
+base_url = "http://127.0.0.1:3050/v1"
+wire_api = "responses"
+experimental_bearer_token = "user_pool"   # placeholder; real keys live in keys.json
+```
+
+**Admin view**: with `keyPool.adminToken` (or `CC_KEY_POOL_ADMIN_TOKEN`) set, `GET /admin/keys`
+is served when called with the `x-admin-token` header or `?token=`; without a token the route is 404.
+It reports each key's label, cooldown reason and deadline (local time), weekly/5-hour usage,
+remaining credits and in-flight count — **only hash prefixes, never plaintext keys**.
+
+**Caveats**
+
+- A response that has already started streaming to the client is never retried on another key
+  (that would duplicate or truncate output).
+- After a switch, the same conversation gets a different threadId (so thread A never leaks into
+  account B); the trade-off is that the new account has no cache of that conversation.
+- The quota endpoint is undocumented; missing fields only produce a warning, never a guess. Quota
+  decisions always use `exceeded` / `used >= cap` (`limited` is also `true` for healthy accounts).
+- Do not share one `keys.state.json` between multiple proxy processes (there is no cross-process lock).
 
 ### Tool screenshot budget
 
