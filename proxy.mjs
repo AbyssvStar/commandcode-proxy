@@ -1854,7 +1854,8 @@ function createKeyPool(cfg) {
     ratio: (w.used !== null && w.cap) ? Number((w.used / w.cap).toFixed(3)) : null,
     exceeded: w.exceeded === true,
     resetAt: w.resetAt,
-    resetAtLocal: fmtLocalTime(w.resetAt),
+    // 上游对「本窗口还没用量」返回 resetAt=0，别在视图里显示成 1970
+    resetAtLocal: w.resetAt > 0 ? fmtLocalTime(w.resetAt) : null,
   });
   pool.snapshot = () => {
     const now = Date.now();
