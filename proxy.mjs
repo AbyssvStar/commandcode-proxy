@@ -1847,6 +1847,44 @@ function createKeyPool(cfg) {
     t0.unref?.();
   };
 
+  // 只读视图：给 /admin/keys 用。只暴露 id（hash 前 8 位）与 label，绝不回显 key。
+  const windowView = (w) => ({
+    used: w.used,
+    cap: w.cap,
+    ratio: (w.used !== null && w.cap) ? Number((w.used / w.cap).toFixed(3)) : null,
+    exceeded: w.exceeded === true,
+    resetAt: w.resetAt,
+    resetAtLocal: fmtLocalTime(w.resetAt),
+  });
+  pool.snapshot = () => {
+    const now = Date.now();
+    return {
+      enabled: true,
+      switchAtRatio: cfg.switchAtRatio,
+      probeIntervalSec: Math.round(cfg.probeIntervalMs / 1000),
+      maxAttempts: cfg.maxAttempts,
+      activeId: pool.activeId,
+      keys: pool.entries.map(e => ({
+        id: e.id,
+        label: e.label,
+        priority: e.priority,
+        disabled: e.disabled,
+        coolingDown: !!(e.state.cooldownUntil && e.state.cooldownUntil > now),
+        cooldownUntil: e.state.cooldownUntil,
+        cooldownUntilLocal: fmtLocalTime(e.state.cooldownUntil),
+        cooldownReason: e.state.cooldownReason,
+        weekly: windowView(e.state.weekly),
+        fiveHour: windowView(e.state.fiveHour),
+        remainingCredits: e.state.remainingCredits,
+        lastProbeAt: e.state.lastProbeAt,
+        lastProbeAtLocal: fmtLocalTime(e.state.lastProbeAt),
+        lastError: e.state.lastError,
+        inflight: pool.inflight.get(e.id) || 0,
+      })),
+      updatedAt: now,
+    };
+  };
+
   log('info', 'Key pool enabled', {
     keys: pool.entries.length,
     file: cfg.file,
@@ -1932,6 +1970,23 @@ async function forwardWithPool({ body, apiKey, entry, incomingHeaders, signal, p
     currentEntry = next;
     excluded.add(next.id);
   }
+}
+
+// 只读管理视图：默认不存在；设置了 keyPool.adminToken（或 CC_KEY_POOL_ADMIN_TOKEN）才开放。
+// 放在 /admin 下而不是 /v1 下：避免被当成 OpenAI 路由，也方便反代只暴露 /v1。
+function handleAdminKeys(req, res, url) {
+  if (!KEY_POOL.enabled || !POOL_CFG.adminToken) {
+    sendJSON(res, 404, { error: { message: 'Not found', type: 'not_found' } });
+    return;
+  }
+  const given = String(req.headers['x-admin-token'] || url.searchParams.get('token') || '');
+  const ga = Buffer.from(given);
+  const ea = Buffer.from(POOL_CFG.adminToken);
+  if (ga.length !== ea.length || !crypto.timingSafeEqual(ga, ea)) {
+    sendJSON(res, 401, { error: { message: 'Invalid admin token', type: 'authentication_error' } });
+    return;
+  }
+  sendJSON(res, 200, KEY_POOL.snapshot());
 }
 
 // ── 路由 ────────────────────────────────────────────
@@ -4321,7 +4376,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
-    if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
+    if (url.pathname === '/admin/keys' && req.method === 'GET') {
+      handleAdminKeys(req, res, url);
+    } else if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
       await handleChatCompletions(req, res);
     } else if (url.pathname === '/v1/messages' && req.method === 'POST') {
       await handleMessages(req, res);
