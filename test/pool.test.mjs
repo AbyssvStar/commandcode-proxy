@@ -191,8 +191,7 @@ test('探测发现周额度达 95% → 冷却该 key，后续请求直接走另�
   }
 });
 
-test('同一会话落到不同 key 上用不同 threadId；同一 key 上保持稳定', async () => {
-  const t = await startPool({ generate: { [KEY_A]: QUOTA_400 } });
+test('同一会话落到不同 key 上用不同 threadId；同一 key 上保持稳定', async () => {  const t = await startPool({ generate: { [KEY_A]: QUOTA_400 } });
   try {
     const session = 'sess-shared-1';
     const body = { ...chatBody(), prompt_cache_key: session };
@@ -216,5 +215,38 @@ test('同一会话落到不同 key 上用不同 threadId；同一 key 上保持�
     assert.equal(bodies[bodies.length - 1].threadId, salted(KEY_B));
   } finally {
     await t.close();
+  }
+});
+
+test('/admin/keys：只读、不泄漏明文 key、token 错误 401；未配置 token 时 404', async () => {
+  const t = await startPool({ keyPool: { adminToken: 'test-admin' }, generate: { [KEY_A]: QUOTA_400 } });
+  try {
+    // 先打一次请求：A 额度耗尽冷却，B 成为活跃 key
+    await t.proxy.post('/v1/chat/completions', chatBody());
+
+    const bad = await t.proxy.get('/admin/keys', { headers: { 'x-admin-token': 'nope' } });
+    assert.equal(bad.status, 401);
+
+    const ok = await t.proxy.get('/admin/keys?token=test-admin');
+    assert.equal(ok.status, 200);
+    const snap = await ok.json();
+    assert.equal(snap.keys.length, 2);
+    const a = snap.keys.find(k => k.label === 'A');
+    assert.equal(a.cooldownReason, 'weekly_limit');
+    assert.ok(a.cooldownUntilLocal, 'cooldownUntil 应附本机时间，方便人看');
+    // 视图里绝不能出现明文 key
+    assert.equal(JSON.stringify(snap).includes(KEY_A), false);
+    assert.equal(JSON.stringify(snap).includes(KEY_B), false);
+  } finally {
+    await t.close();
+  }
+
+  // 没配 adminToken 时该路由不存在（默认不暴露管理面）
+  const t2 = await startPool();
+  try {
+    const r = await t2.proxy.get('/admin/keys');
+    assert.equal(r.status, 404);
+  } finally {
+    await t2.close();
   }
 });
