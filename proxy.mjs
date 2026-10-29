@@ -83,24 +83,30 @@ function loadConfig() {
 
 const CFG = loadConfig();
 
-// ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.53.1） ──────
-// CPU 型号与核心数对应表（仅 Windows x64）
+// ── 设备指纹（形态与哈希逐字对齐官方 CLI；1.53.1 对齐，1.54.0 复核未变） ──
+// CPU 型号与核数对应表（仅 Windows x64）。
+// ⚠️ 上网的 components.cpuCount 必须是 **threads** 而不是 cores ——
+// CLI 的 gatherRawSignals 取的是 `os.cpus().length`，即**逻辑处理器数**。
+// 这一对是明文上传的（components 里只有 machineId/mac/osUser/hostname/gitEmail 走哈希），
+// 所以 cpuModel 与 cpuCount 可以被服务端交叉核对：填物理核数等于宣称「这台机器关了超线程」，
+// 而原表 15 项全是物理核数 —— 100% 的指纹都落在这个罕见表述上，是群体分布层面的特征。
+// （实现参考 @jinyu2022 的 PR #35，数字逐项复核过。）
 const FINGERPRINT_CPUS = [
-  { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },   // TEMP-REVERT
-  { model: '12th Gen Intel(R) Core(TM) i5-12400F', cores: 6 },
-  { model: '12th Gen Intel(R) Core(TM) i9-12900K', cores: 16 },
-  { model: '13th Gen Intel(R) Core(TM) i7-13700K', cores: 16 },
-  { model: '13th Gen Intel(R) Core(TM) i5-13600K', cores: 14 },
-  { model: '13th Gen Intel(R) Core(TM) i9-13900K', cores: 24 },
-  { model: 'Intel(R) Core(TM) Ultra 7 155H', cores: 16 },
-  { model: 'Intel(R) Core(TM) Ultra 9 285H', cores: 16 },
-  { model: 'Intel(R) Core(TM) i9-14900K', cores: 24 },
-  { model: 'Intel(R) Core(TM) i7-14700K', cores: 20 },
-  { model: 'AMD Ryzen 7 7800X3D', cores: 8 },
-  { model: 'AMD Ryzen 9 7950X', cores: 16 },
-  { model: 'AMD Ryzen 5 7600', cores: 6 },
-  { model: 'AMD Ryzen 9 7900X', cores: 12 },
-  { model: 'AMD Ryzen 7 5800X3D', cores: 8 },
+  { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10, threads: 16 },   // 6P+4E
+  { model: '12th Gen Intel(R) Core(TM) i5-12400F', cores: 6,  threads: 12 },
+  { model: '12th Gen Intel(R) Core(TM) i9-12900K', cores: 16, threads: 24 },   // 8P+8E
+  { model: '13th Gen Intel(R) Core(TM) i7-13700K', cores: 16, threads: 24 },   // 8P+8E
+  { model: '13th Gen Intel(R) Core(TM) i5-13600K', cores: 14, threads: 20 },   // 6P+8E
+  { model: '13th Gen Intel(R) Core(TM) i9-13900K', cores: 24, threads: 32 },   // 8P+16E
+  { model: 'Intel(R) Core(TM) Ultra 7 155H',       cores: 16, threads: 22 },   // 6P+8E+2LPE（Meteor Lake 有超线程）
+  { model: 'Intel(R) Core(TM) Ultra 9 285H',       cores: 16, threads: 16 },   // 6P+8E+2LPE（Arrow Lake 取消超线程）
+  { model: 'Intel(R) Core(TM) i9-14900K',          cores: 24, threads: 32 },   // 8P+16E
+  { model: 'Intel(R) Core(TM) i7-14700K',          cores: 20, threads: 28 },   // 8P+12E
+  { model: 'AMD Ryzen 7 7800X3D',                  cores: 8,  threads: 16 },
+  { model: 'AMD Ryzen 9 7950X',                    cores: 16, threads: 32 },
+  { model: 'AMD Ryzen 5 7600',                     cores: 6,  threads: 12 },
+  { model: 'AMD Ryzen 9 7900X',                    cores: 12, threads: 24 },
+  { model: 'AMD Ryzen 7 5800X3D',                  cores: 8,  threads: 16 },
 ];
 const FINGERPRINT_MEMS = [8, 16, 24, 32, 48, 64];
 const FINGERPRINT_TZS = [
@@ -111,6 +117,18 @@ const FINGERPRINT_TZS = [
 ];
 const FINGERPRINT_MAC_COUNT_RANGE = [2, 3, 4, 5]; // 随机 2~5 个 MAC
 
+// ── 为什么指纹必须由 apiKey 确定性派生（而不是随机） ──────────────
+// 指纹代表「这个账号对应的那台设备」。原实现每进程随机生成一台新机器，
+// 会在三个场景下毫无理由地漂移：① 进程重启 ② 多实例各算各的
+// ③ session 过期清理连带 keyStateStore.delete。设备身份无故更换本身就是信号。
+//
+// 也不能退化成「按 key 取哈希桶选设备」：桶方案的熵上限就是桶数，key 数一旦
+// 超过桶数必然出现多个 key 共用指纹，而上游 device_fingerprints 表对
+// (userId, thumbmark) 建了唯一索引 —— 共用指纹等于「多账号同机」的直接证据。
+// 派生方案每个 key 都是独立设备，碰撞概率 2^-256。
+//
+// 原始信号值（MachineGuid / MAC / 主机名 / git 邮箱）只存在于本进程内存，
+// 出网的永远只有它们的哈希。
 // CLI 的根盐（buildMachineFingerprint 常量 sb）
 const FP_SALT = 'command-code:device-fingerprint:v1';
 // 设备档案：指纹 / config.environment / config.workingDir / x-project-slug / lifecycle.os 共用同一份，
@@ -198,7 +216,7 @@ function generateFingerprint(apiKey) {
       arch: DEVICE_PROFILE.arch,
       osRelease: DEVICE_PROFILE.osRelease,
       cpuModel: cpuEntry.model,
-      cpuCount: cpuEntry.cores,
+      cpuCount: cpuEntry.threads,   // 逻辑处理器数，对齐 CLI 的 os.cpus().length
       memGiB,
       isContainer: DEVICE_PROFILE.isContainer,
       timezone: tz,
@@ -240,12 +258,19 @@ async function checkProtocolDrift() {
 checkProtocolDrift(); // 启动时立即检查
 setInterval(checkProtocolDrift, CC_VERSION_REFRESH_MS);
 
-// 请求体大小上限：默认 100MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）
+// 请求体大小上限：默认 100MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）。
+// 默认值保持 100MB（573e260 为修 issue #7 设定）——不要下调，理由是有实际证据的：
+//   #7 的真实触发场景是多模态长会话，21 张 Base64 图片累积到约 10.11 MiB 的合法请求，
+//   下调到 4~8MB 会把这类请求整体挡在门外。#7 的「Connection error」症状由
+//   「超限返回 413 + 排空连接」这条路径解决，与阈值取值无关；但阈值决定了功能边界，
+//   所以默认值必须容纳真实的多模态上下文。
 // ⚠️ 内存特性（issue #20 实测）：请求体在转发到上游前会同时存在多份副本 ——
 //    chunks[] / Buffer.concat / utf8 字符串 / JSON.parse 对象树 / buildCcRequest 重建对象树 / JSON.stringify 序列化体。
 //    实测峰值 ≈ body 大小 × 5.1~7.4（7MB→+52MB，20MB→+116MB；而 413 拒绝路径只要 ×1.05）。
 //    故 100MB 上限意味着「单个请求」最坏可吃 ~550MB，且该上限是每请求的、不是全局的。
-//    公网/多用户部署请在反向代理层同时限制 body 大小与在途请求数（见 README「内存与部署」）。
+//    正因为阈值必须留足，#20 的第二半必须补齐：并发侧要有约束。
+//    进程内可用 CC_MAX_INFLIGHT，边缘侧用反向代理 limit_conn
+//    （见 README「内存与部署」）。
 const MAX_BODY_SIZE = (() => {
   const mb = Number.parseInt(process.env.CC_MAX_BODY_MB ?? '', 10);
   return Number.isFinite(mb) && mb > 0 ? mb * 1024 * 1024 : 100 * 1024 * 1024;
@@ -340,45 +365,38 @@ function summarizeUpstreamError(text, limit = 500) {
   return flat.length > limit ? flat.slice(0, limit) + '…(' + (flat.length - limit) + ' more)' : flat;
 }
 
-// ── 会话管理 ───────────────────────────────────────
-// 每个 API Key 独立一个 session，12h 过期 + 1h 随机抖动
-// 同一 Key 在同一周期内复用，到期自动换新
-const SESSION_DURATION_MS = 12 * 60 * 60 * 1000;    // 12h
-const SESSION_JITTER_MS  = 60 * 60 * 1000;           // 1h 抖动范围
-
-const sessionStore = new Map(); // apiKey → { sessionId, expiresAt }
-
-function ensureSession(apiKey) {
-  const now = Date.now();
-  const entry = sessionStore.get(apiKey);
-
-  if (entry && now < entry.expiresAt) {
-    return entry.sessionId;
-  }
-
-  // 过期或第一次：生成新 session
-  const jitter = Math.floor(Math.random() * SESSION_JITTER_MS);
-  const sessionId = randomUUID();
-  sessionStore.set(apiKey, { sessionId, expiresAt: now + SESSION_DURATION_MS + jitter });
-      log('info', 'Session created', { sessionId: sessionId.slice(0, 8), storeSize: sessionStore.size });
-  return sessionId;
-}
-
-// 定期清理过期 session 和 key 状态，防止 Map 无限增长
-setInterval(() => {
-  const now = Date.now();
-  let cleaned = 0;
-  for (const [key, entry] of sessionStore) {
-    if (now >= entry.expiresAt) {
-      sessionStore.delete(key);
-      keyStateStore.delete(key); // 同时清理该 key 的指纹状态
-      cleaned++;
+/**
+ * 按请求内容派生 UUID：apiKey + model + system + 首个非 user 消息之前的连续 user 文本。
+ * @param {string} apiKey 上游账号 key
+ * @param {CcRequestBody} ccBody buildCcRequest 的返回值
+ * @returns {string} UUID 字符串
+ */
+function deriveSessionId(apiKey, ccBody) {
+  const params = (ccBody && ccBody.params) || {};
+  // 逐块喂入，'\0'分隔
+  const h = crypto.createHash('sha1');
+  h.update(apiKey || '').update('\0');
+  h.update(params.model || '').update('\0');
+  if (Array.isArray(params.system)) {
+    for (const b of params.system || []) {
+      if (b && typeof b.text === 'string') h.update(b.text).update('\0');
     }
   }
-  if (cleaned > 0) log('info', 'Session cleanup', { cleaned, remaining: sessionStore.size });
-}, 60 * 60 * 1000); // 每小时
+  for (const msg of params.messages || []) {
+    if (msg.role !== 'user') break; // assistant / tool 起始后的输入不参与派生
+    if (!Array.isArray(msg.content)) continue;
+    for (const p of msg.content) {
+      if (p.type === 'text' && typeof p.text === 'string') h.update(p.text).update('\0');
+    }
+  }
+  const bytes = h.digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
-function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
+function getSessionId(incomingHeaders, apiKey, promptCacheKey, ccBody) {
   // 优先从客户端传来的 session 类 header 获取
   const candidates = [
     incomingHeaders['x-session-id'],
@@ -389,16 +407,24 @@ function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
   for (const id of candidates) {
     if (id && typeof id === 'string' && id.length >= 8) return id;
   }
-  // 按 API Key 分 session
-  return ensureSession(apiKey);
+  // 客户端未提供会话标识时按请求内容派生
+  return deriveSessionId(apiKey, ccBody);
 }
 
-// 每个请求独立 thread ID
-function newThreadId() { return randomUUID(); }
+// CC 线上信封的 threadId 只接受合法 UUID —— 对应 CLI 的 toWireThreadId：
+// uuid.safeParse 失败即返回 undefined，该键随之被 JSON.stringify 丢弃。
+// 非 UUID 的 session 值一律不发，避免上游看到真 CLI 永远不会产生的 threadId。
+function isWireUuid(v) {
+  return typeof v === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+}
 
 // ── 每 Key 独立状态（fingerprint + 初始化节流） ──
-// 每个 API Key 拥有自己的设备指纹和初始化定时器
-const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt }
+// 指纹现在是确定性派生的，所以这个 Map 只是缓存：淘汰它不会改变该 key 的设备身份，
+// 只是下次多算一次 HMAC。淘汰按「空闲」而非「session 过期」判定，
+// 这样活跃 key 的 nextInitAt 不会被重置（否则会重复发送指纹/lifecycle 预请求）。
+const KEY_STATE_IDLE_MS = 24 * 60 * 60 * 1000; // 24h 未活动即淘汰
+const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt, lastSeen }
 
 function getOrCreateKeyState(apiKey) {
   let state = keyStateStore.get(apiKey);
@@ -406,12 +432,27 @@ function getOrCreateKeyState(apiKey) {
     state = {
       fingerprint: generateFingerprint(apiKey),
       nextInitAt: 0,
+      lastSeen: 0,
     };
     keyStateStore.set(apiKey, state);
-    log('info', 'Fingerprint generated for key', { keyPrefix: apiKey.slice(0, 8) });
+    log('info', 'Fingerprint derived for key', {
+      keyPrefix: apiKey.slice(0, 8),
+      thumbmark: state.fingerprint.thumbmark.slice(0, 12),
+    });
   }
+  state.lastSeen = Date.now();
   return state;
 }
+
+// 空闲淘汰：纯内存卫生，不影响设备身份（见上）
+setInterval(() => {
+  const now = Date.now();
+  let evicted = 0;
+  for (const [key, state] of keyStateStore) {
+    if (now - state.lastSeen > KEY_STATE_IDLE_MS) { keyStateStore.delete(key); evicted++; }
+  }
+  if (evicted > 0) log('info', 'Key state evicted (idle)', { evicted, remaining: keyStateStore.size });
+}, 60 * 60 * 1000); // 每小时
 
 // ── 初始化预请求（fingerprint + lifecycle，首次 + 每 8h+2h 抖动） ────
 const INIT_REFRESH_MS = 8 * 60 * 60 * 1000;    // 8h
@@ -426,6 +467,11 @@ async function ensureInitialized(apiKey, signal) {
     // 并行发两个预请求
     const headers = {
       'Content-Type': 'application/json',
+      // 官方 CLI 的指纹预请求与生成请求共用同一个 header 常量表（lb = vy = "cli"），
+      // 因此预请求同样是 User-Agent: cli。此前只有 forwardToCC 设了它，
+      // 预请求走 Node 默认的 "node" —— 同一账号的指纹注册与生成请求来自两种 UA，
+      // 是可直接观测的破绽。
+      'User-Agent': 'cli',
       'x-cli-environment': 'production',
       'Authorization': `Bearer ${apiKey}`,
       'x-command-code-version': CC_VERSION,
@@ -541,6 +587,79 @@ function getDateStr() {
 
 // ── CC 请求体构建 ─────────────────────────────────
 
+/**
+ * params.system 的块形态（toWireSystem），非末块补 \n，可带缓存断点。
+ * @typedef {Object} CcSystemBlock
+ * @property {'text'} type
+ * @property {string} text
+ * @property {{ type: 'ephemeral' }} [cache_control]
+ */
+
+/**
+ * messages 里的内容块联合类型：text / image / reasoning / tool-call / tool-result。
+ * @typedef {Object} CcTextPart
+ * @property {'text'} type
+ * @property {string} text
+ * @property {{ type: 'ephemeral' }} [cache_control]
+ * @typedef {Object} CcImagePart
+ * @property {'image'} type
+ * @property {string} image        // data:<mime>;base64,...
+ * @property {string} [mimeType]
+ * @typedef {Object} CcReasoningPart
+ * @property {'reasoning'} type
+ * @property {string} text
+ * @typedef {Object} CcToolCallPart
+ * @property {'tool-call'} type
+ * @property {string} toolCallId
+ * @property {string} toolName
+ * @property {string|object} input
+ * @typedef {Object} CcToolResultPart
+ * @property {'tool-result'} type
+ * @property {string} toolCallId
+ * @property {string} toolName
+ * @property {{ type: 'text', value: string }} output
+ * @typedef {CcTextPart|CcImagePart|CcReasoningPart|CcToolCallPart|CcToolResultPart} CcContentPart
+ */
+
+/**
+ * wire 格式的单条消息（buildCcRequest 的 ccMessages 元素）。
+ * @typedef {Object} CcMessage
+ * @property {'user'|'assistant'|'tool'} role
+ * @property {CcContentPart[]} content
+ */
+
+/**
+ * 信封 params 块。
+ * @typedef {Object} CcRequestParams
+ * @property {string} model
+ * @property {CcMessage[]} messages
+ * @property {CcSystemBlock[]} [system]
+ * @property {number} max_tokens
+ * @property {true} stream            // CC API 总是 stream
+ * @property {number} [temperature]
+ * @property {string} [reasoning_effort]
+ * @property {{ name: string, description: string, input_schema: object }[]} tools
+ * @property {{ type: 'auto'|'none'|'any'|'tool', name?: string }} [tool_choice]
+ * @property {boolean} [parallel_tool_calls]
+ */
+
+/**
+ * /alpha/generate 的 9 键信封（threadId 由 forwardToCC 重排时插入）。
+ * @typedef {Object} CcRequestBody
+ * @property {{ workingDir: string, date: string, environment: string, structure: string[],
+ *   isGitRepo: boolean, currentBranch: string, mainBranch: string, gitStatus: string,
+ *   recentCommits: string[] }} config
+ * @property {null} memory
+ * @property {null} taste
+ * @property {null} skills
+ * @property {'standard'} permissionMode
+ * @property {string} mode
+ * @property {CcRequestParams} params
+ */
+
+/**
+ * @returns {CcRequestBody}
+ */
 function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
@@ -570,6 +689,7 @@ function buildCcRequest(openaiReq) {
   const chatMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
 
   // Build tool_call_id → tool_name reverse lookup
+  // 名字原样透传（理由见 toWireToolName 删除处的注释）。
   const toolNameMap = {};
   for (const msg of chatMessages) {
     if (msg.role === 'assistant' && msg.tool_calls) {
@@ -636,6 +756,7 @@ function buildCcRequest(openaiReq) {
       return { role: 'assistant', content: parts };
     }
     if (msg.role === 'tool') {
+      // toolName 与上面 tool-call 里的一致（同一张 map），不重命名
       return {
         role: 'tool',
         content: [{
@@ -705,16 +826,20 @@ function buildCcRequest(openaiReq) {
     body.params.reasoning_effort = reasoning_effort;
   }
   // CLI 总是下发 tools（没有工具时是空数组）—— 空数组与缺键在 wire 上可观测，这里对齐
-  // CLI 的 toWireTools：只有 name / description / input_schema，没有 type 字段
+  // CLI 的 toWireTools：只有 name / description / input_schema，没有 type 字段；
+  // 且**不做**任何名字重写（理由见下面「工具名重写整段删除」的注释）
   body.params.tools = (tools || []).map(t => ({
-      name: toWireToolName(t.function?.name || t.name || ''),
+      name: t.function?.name || t.name || '',
       description: t.function?.description || t.description || '',
       input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
     }));
   if (tool_choice !== undefined) {
-    // OpenAI 格式 → CC (Anthropic 风格) 格式
-    if (typeof tool_choice === 'string') {
-      const map = { 'auto': 'auto', 'none': 'none', 'required': 'any' };
+    if (tool_choice === 'none' || (typeof tool_choice === 'object' && tool_choice?.type === 'none')) {
+      // none 表示本轮禁用工具：CC 上游 tool_choice 枚举只有 auto / any / tool，
+      // 传 none 会被 CC 以 400 拒绝。语义上清空 tools 且不下发 tool_choice。
+      body.params.tools = [];
+    } else if (typeof tool_choice === 'string') {
+      const map = { 'auto': 'auto', 'required': 'any' };
       body.params.tool_choice = { type: map[tool_choice] || 'auto' };
     } else if (tool_choice.type === 'function') {
       // OpenAI object → Anthropic object
@@ -730,14 +855,31 @@ function buildCcRequest(openaiReq) {
   return body;
 }
 
-// CLI 发送前会重写部分工具名（resolveToolNameAlias / ow 表）
-const TOOL_NAME_ALIASES = {
-  bash_output: 'shell_output',
-  task_output: 'shell_output',
-  tool_search: 'search_tools',
-  read_multiple_files: 'read_file',
-};
-function toWireToolName(name) { return TOOL_NAME_ALIASES[name] || name; }
+// ── 工具名为什么一个都不重命名（已删掉的别名表的墓志铭） ──────────────
+// 上游 d063b47 曾引入一张 4 项别名表并作用于 params.tools[].name。查 CLI 源码后
+// （command-code@1.54.0 dist/cli.mjs）确认：**wire 协议里没有工具重命名这回事**。
+//
+// CLI 里确实存在两个改名的函数，但都不适用于反代：
+//
+//   toWireToolName(e){return e===rw?nw:e}      // rw="tool_search" → nw="search_tools"
+//     —— 只作用在 toWireMessages（tool-call 与 tool-result，两边同名），
+//        不作用在 toWireTools（声明原样下发）。它的存在前提是 CLI 自己退役过
+//        tool_search 这个名字：createRetiredToolSearchTool 给的 visible:()=>false，
+//        该工具从不进 params.tools，只有重放旧会话时历史里才会残留这个旧名。
+//
+//   resolveToolNameAlias(ow 表)                 // bash_output/task_output/read_multiple_files
+//     —— 被工具执行器调用：模型喊了退役名时本地按新名跑，回一句给模型看的
+//        "Repair note"，并按 defaults 补参（task_output 会补 wait:"exit"）。
+//        这是执行语义、不是 wire 变换。
+//
+// 反代没有这个前提：params.tools 由下游客户端给出，proxy 没有 catalog、没有退役名，
+// 请求里出现的每个名字对 proxy 来说都是当前名。若强行重命名，一旦客户端恰好声明了
+// 一个叫 tool_search 的工具，就会变成「声明 tool_search、消息 search_tools」——
+// 下游按自己声明的名字派发不到工具（issue #36 / #37 的根因）。
+//
+// 因此这里全程原样透传。若将来真要支持「重放真实 CLI 旧会话」，正确做法是**入站**
+// 归一化 + 显式开关，并连 defaults 一起补，与 resolveToolNameAlias 同语义；
+// 绝不要做成「上行改、下行不改」。
 
 // CLI 的 toWireToolOutput：只取文本块，用 '\n' 拼接
 function toWireToolOutputValue(content) {
@@ -760,6 +902,9 @@ function createSseTranslator(model, completionId, created) {
   let chunkIndex = 0;
   let sentRole = false;
   let finishReason = null;
+  let unsupportedFinishReason = null;
+  // 只承载「上游连接失败族」的 finishReason（见 toOpenAIFinishReason 的说明）：
+  // 不认识的结束原因折成 stop 正常收尾，不再进这里。
   let usage = null;
   let toolCallIndex = 0;
 
@@ -850,7 +995,17 @@ function createSseTranslator(model, completionId, created) {
             total_tokens: (u.inputTokens ?? 0) + (u.outputTokens ?? 0),
             prompt_tokens_details: { cached_tokens: u.cachedInputTokens ?? 0 },
           } : undefined;
-          out.push(makeChunk(completionId, created, model, {}, fr, openaiUsage));
+          if (OPENAI_FINISH_REASONS.has(fr)) {
+            out.push(makeChunk(completionId, created, model, {}, fr, openaiUsage));
+          } else {
+            // 走到这里只剩「上游连接失败族」（upstream_error；CC 在 provider 返回空
+            // 响应时发的裸 'error' 已在 mapFinishReason 里并入它）。原样写进 SSE 会让
+            // 严格客户端把整条流判成反序列化失败（GrokZen：unknown variant `error`），
+            // 且丢失「可重试」信号。交回流尾 incompleteDetail()，按可重试错误上报。
+            // 不认识的结束原因（实测 'other'）不在这里 —— toOpenAIFinishReason 已把它
+            // 折成 stop，因为它表示「这一轮结束了」，不是「没完成」。
+            unsupportedFinishReason = fr;
+          }
           break;
         }
 
@@ -885,7 +1040,15 @@ function createSseTranslator(model, completionId, created) {
 
     /** 这次上游流若没有正常走完 finish，返回可读原因；正常则为 null。 */
     incompleteDetail() {
-      return incompleteUpstreamDetail(sawFinish, finishReason);
+      const standard = incompleteUpstreamDetail(sawFinish, finishReason);
+      if (standard) return standard;
+      if (!unsupportedFinishReason) return null;
+      // 到这里只剩上游连接失败族（'upstream_error'），措辞与 network/connection-error
+      // 一致。末句保留作防御：不认识的结束原因已由 toOpenAIFinishReason 折成 stop，
+      // 不再走这条路径。
+      return unsupportedFinishReason === 'upstream_error'
+        ? 'provider reported an upstream connection failure'
+        : `provider reported an unsupported finish reason (${unsupportedFinishReason})`;
     },
 
     /** 获取 SSE 结束标记 */
@@ -941,18 +1104,24 @@ function anthropicInputTokens(usage, noCacheOverride) {
 //   tool_use | tool-calls | tool_calls                    → tool_calls
 //   length | max_tokens | max_output_tokens
 //          | model_context_window_exceeded                → length
-//   /^(network|connection|upstream)[-_\s]?error$/i        → upstream_error
+//   error | /^(network|connection|upstream)[-_\s]?error$/i → upstream_error
 //   pause_turn                                            → pause_turn（原样保留）
 // 关键点：'length' 家族**不止 'length' 一个值**。max_output_tokens 与
 // model_context_window_exceeded 都是「输出被截断」，折成 stop/end_turn 等于
 // 把半截回答谎报成完整回答。未知值一律原样返回，宁可让它露出来也不要静默折成 stop。
+// 这里只是**内部**词汇表：露出来的值到出口会由 toOpenAIFinishReason 处理（连接失败族
+// 保原值走可重试 502，其余折成 stop），不会以非法 finish_reason 透给客户端。
+//
+// 例外：裸 'error' 必须并进 upstream_error。Command Code 在 provider 返回空响应时
+// 发 `finish` + `finishReason:"error"`；它不是可透出的业务值，原样返回会变成非法的
+// OpenAI finish_reason（严格客户端整条流反序列化失败），也会丢掉可重试语义。
 function mapFinishReason(reason) {
   const r = String(reason ?? '').trim().toLowerCase();
   if (!r) return 'stop';
   if (r === 'tool-calls' || r === 'tool_calls' || r === 'tool_use') return 'tool_calls';
   if (r === 'length' || r === 'max_tokens'
       || r === 'max_output_tokens' || r === 'model_context_window_exceeded') return 'length';
-  if (/^(?:network|connection|upstream)[-_\s]?error$/.test(r)) return 'upstream_error';
+  if (r === 'error' || /^(?:network|connection|upstream)[-_\s]?error$/.test(r)) return 'upstream_error';
   return r;
 }
 
@@ -1134,8 +1303,22 @@ function readBody(req) {
         settled = true;
         chunks.length = 0;
         const mb = Math.round(MAX_BODY_SIZE / 1024 / 1024);
-        const err = new Error(`Request body exceeds ${mb}MB limit`);
+        // 只报上限等于让人去猜自己超了多少 —— 客户端要据此决定"拆请求"还是"去申请提额"。
+        // nginx 开了 proxy_request_buffering 时会带 Content-Length，据此给出真实体积；
+        // 没有该头（chunked）时退回"已收到多少"，并标注它是下界。
+        const declared = Number.parseInt(req.headers['content-length'] ?? '', 10);
+        const known = Number.isFinite(declared) && declared > 0;
+        const bytes = known ? declared : totalSize;
+        const sizeNote = ` (body is ${(bytes / 1048576).toFixed(1)}MB${known ? '' : '+'})`;
+        log('warn', 'Request body rejected (too large)', {
+          path: req.url,
+          limitMB: mb,
+          bodyMB: +(bytes / 1048576).toFixed(1),
+          exact: known,
+        });
+        const err = new Error(`Request body exceeds ${mb}MB limit${sizeNote}`);
         err.statusCode = 413;
+        err.bodyBytes = bytes;
         reject(err);
         return;
       }
@@ -1368,13 +1551,16 @@ function upstreamFetch(urlStr, options) {
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
-  const rawSessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
-  // 池模式下同一会话落到不同 key 上必须是不同 thread：账号之间不能共享 thread；
-  // 同一 key + 同一 session 的哈希是稳定的，所以该账号自己的缓存仍然保留。
-  const sessionId = KEY_POOL.enabled ? KEY_POOL.threadIdFor(apiKey, rawSessionId) : rawSessionId;
+  const rawSessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey, body);
+  // 池模式下同一会话落到不同 key 上不能共享 thread。内容派生的 session 已把 apiKey
+  // 纳入哈希、天然按 key 隔离；这里只处理客户端显式带来的 session：加盐保证跨 key 不同，
+  // 但非 UUID 的值原样保留，由下面的 isWireUuid 拦掉（上游只接受合法 UUID）。
+  const sessionId = KEY_POOL.enabled && isWireUuid(rawSessionId)
+    ? KEY_POOL.threadIdFor(apiKey, rawSessionId)
+    : rawSessionId;
   // CLI 的 toWireThreadId：只有合法 UUID 才放进信封，否则整个键省略。
   // 同时按 CLI 的键顺序重排：config, memory, taste, skills, permissionMode, threadId, mode, params
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(sessionId))) {
+  if (isWireUuid(sessionId)) {
     const ordered = {};
     for (const k of ['config', 'memory', 'taste', 'skills', 'permissionMode']) ordered[k] = body[k];
     ordered.threadId = sessionId;
@@ -1919,7 +2105,16 @@ function noteQuotaToPool(apiKey, mapped) {
 // 返回值二选一：{ response, apiKey, entry } 或 { error: { status, retryAfter, body } }。
 async function forwardWithPool({ body, apiKey, entry, incomingHeaders, signal, promptCacheKey }) {
   if (!KEY_POOL.enabled) {
-    return { response: await forwardToCC(body, apiKey, incomingHeaders, signal, promptCacheKey) };
+    const response = await forwardToCC(body, apiKey, incomingHeaders, signal, promptCacheKey);
+    if (response.ok) return { response };
+    // 非池模式也要把上游错误映射成下游语义（400/401/422/402…），
+    // 不能把错误体当成 SSE 往下读 —— 那会变成 502 proxy_error。
+    const text = await response.text().catch(() => '');
+    const mapped = mapCcError(response.status, text);
+    log('error', 'CC API error', {
+      status: response.status, code: mapped.code, body: summarizeUpstreamError(text),
+    });
+    return { error: { status: mapped.status, retryAfter: mapped.body.retry_after ?? null, body: mapped.body } };
   }
   const excluded = new Set();
   if (entry) excluded.add(entry.id);
@@ -2023,6 +2218,10 @@ async function handleChatCompletions(req, res) {
 
   // 构建 CC 请求体
   const ccBody = buildCcRequest(openaiReq);
+  // issue #20：ccBody 建好后，openaiReq 这棵 20MB 级对象树只剩 prompt_cache_key 还被用到。
+  // 先取出该值再断开引用，让这一份副本可以更早被 GC 回收（原来是整段请求期间一直活着）。
+  const promptCacheKey = openaiReq.prompt_cache_key;
+  openaiReq = null;
 
   // AbortController 用于客户端断连时真正打断 CC 上游（pi-commandcode-provider 模式）
   // 每次尝试都换一个新的（已 abort 的 signal 不可复用）
@@ -2054,6 +2253,48 @@ async function handleChatCompletions(req, res) {
     await sleep(UPSTREAM_RETRY_BASE_MS * attempt);
   };
 
+  // 下游断连检测：打断 CC 上游 + 记录日志 —— 必须挂在重试循环**之前**、无条件注册恰好一次。
+  // #50 初版把它放在「attempt === 1 且已拿到上游响应头」的分支里：而第 1 次尝试恰恰可能在
+  // 响应头之前就闪断（这正是重试特性要处理的场景），该分支永远走不到，之后所有尝试便
+  // 再也没有断连监听 —— 客户端已断开仍会继续打上游（白烧额度 / 放大 QPS），还会把
+  // 「对着空气交付」误记成 retry recovered（issue #55）。
+  // 回调读的 abortController 是每次尝试重绑的 let，闭包取到的永远是当前尝试的控制器，
+  // 所以注册一次即可，重试不需要重复挂载。
+  res.on('close', () => {
+    if (res.writableEnded) return; // Normal completion, not a disconnect
+    aborted = true;
+    const reason = lastCcEvent?.startsWith('tool-input') ? 'tool-input-silent-timeout'
+      : lastCcEvent?.includes('delta') ? 'streaming-active-disconnect'
+      : 'client-hangup';
+    abortController.signal.aborted || log('warn', 'Client disconnected', {
+      path: '/v1/chat/completions',
+      model, completionId, reason,
+      streaming: stream,
+      elapsedMs: Date.now() - startTime,
+      bytesSent: bytesReceived,
+      lastCcEvent: lastCcEvent || '(none)',
+      keepaliveCount,
+      inputTokens: translator?.inputTokens ?? 0,
+      outputTokens: translator?.outputTokens ?? 0,
+      cachedInputTokens: translator?.cachedInputTokens ?? 0,
+    });
+    if (!abortController.signal.aborted) {
+      // 断连前抢发 usage=0 终止 chunk，避免下游自行估算 token
+      try {
+        res.write(`data: ${JSON.stringify({
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, prompt_tokens_details: { cached_tokens: 0 } },
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
+      } catch {}
+      try { abortController.abort(); } catch {}
+    }
+  });
+
   // 上游闪断重试循环：只在「传输层闪断」且「尚未向下游写出任何字节」时
   // 才再来一遍；正常路径第一轮即 break。循环体沿用原有缩进、未做重排，只为把 diff 控到最小。
   attemptLoop: for (attempt = 1; attempt <= UPSTREAM_RETRY_MAX + 1; attempt++) {
@@ -2080,7 +2321,7 @@ async function handleChatCompletions(req, res) {
       entry: keyPick.entry,
       incomingHeaders: req.headers,
       signal: abortController.signal,
-      promptCacheKey: openaiReq.prompt_cache_key,
+      promptCacheKey,
     });
 
     if (upstream.error) {
@@ -2090,42 +2331,6 @@ async function handleChatCompletions(req, res) {
       return;
     }
     const ccResponse = upstream.response;
-
-    // 下游断连检测：打断 CC 上游 + 记录日志（只在首次尝试注册，重试不重复挂载监听器）
-    if (attempt === 1) res.on('close', () => {
-      if (res.writableEnded) return; // Normal completion, not a disconnect
-      aborted = true;
-      const reason = lastCcEvent?.startsWith('tool-input') ? 'tool-input-silent-timeout'
-        : lastCcEvent?.includes('delta') ? 'streaming-active-disconnect'
-        : 'client-hangup';
-      abortController.signal.aborted || log('warn', 'Client disconnected', {
-        path: '/v1/chat/completions',
-        model, completionId, reason,
-        streaming: stream,
-        elapsedMs: Date.now() - startTime,
-        bytesSent: bytesReceived,
-        lastCcEvent: lastCcEvent || '(none)',
-        keepaliveCount,
-        inputTokens: translator?.inputTokens ?? 0,
-        outputTokens: translator?.outputTokens ?? 0,
-        cachedInputTokens: translator?.cachedInputTokens ?? 0,
-      });
-      if (!abortController.signal.aborted) {
-        // 断连前抢发 usage=0 终止 chunk，避免下游自行估算 token
-        try {
-          res.write(`data: ${JSON.stringify({
-            id: completionId,
-            object: 'chat.completion.chunk',
-            created,
-            model,
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, prompt_tokens_details: { cached_tokens: 0 } },
-          })}\n\n`);
-          res.write('data: [DONE]\n\n');
-        } catch {}
-        try { abortController.abort(); } catch {}
-      }
-    });
 
     if (stream) {
       // ── 流式响应 ──
@@ -2365,7 +2570,7 @@ async function handleChatCompletions(req, res) {
               // 非流式路径会掉进 default 打成 'Unknown CC event type' —— 上游每个响应都会发，
               // 于是线上刷屏。它们本身不携带内容（内容在 text-delta），纯粹是噪音。
               case 'text-start': case 'text-end': case 'start': case 'start-step':
-              case 'reasoning-start': case 'reasoning-end': case 'finish-step':
+              case 'reasoning-start': case 'reasoning-end':
               case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
               case 'tool-error':
                 // Silent - no user-visible content
@@ -2537,8 +2742,29 @@ function mapAnthropicStopReason(finishReason) {
 // OpenAI 的 finish_reason 只有 stop | length | tool_calls | content_filter | function_call。
 // pause_turn 没有对应值：折成 'stop' 是谎报完成（正是要修的问题），
 // 折成 'length' 至少如实表达了「输出不完整」，下游的截断处理会做对的事。
+const OPENAI_FINISH_REASONS = new Set(['stop', 'length', 'tool_calls', 'content_filter', 'function_call']);
+
+// 内部规范化取值 → 可透出的 OpenAI finish_reason。必须**全函数**：任何非标准值
+// 原样写进 SSE / JSON body，严格客户端（GrokZen 的 FinishReason 是无兜底的枚举）
+// 会把整条流判成反序列化失败，丢的是已经流出去的回答。
+//
+// 三种未知值，两种待遇：
+//   · upstream_error —— 上游连接失败族，保留原值：流尾 incompleteDetail() /
+//     incompleteUpstreamDetail() 按可重试 502 上报（语义不动）。
+//   · 其余不认识的值（实测 'other'）—— 上游**确实发过** finish，只是原因不在标准
+//     词汇表里：AI SDK 把不认识的 finish_reason 归成 other，而「一个完成信号都没
+//     收到」在同一实现里归成 error，两者不是一回事。本代理另外两条协议面本来也
+//     就是这么判的（/v1/messages 的 mapAnthropicStopReason 默认 end_turn、
+//     /v1/responses 在 3152 行只拦 no finish / upstream_error，其余走
+//     response.completed），这里对齐成 stop；以前 chat 路径把它折成可重试 502 并
+//     写 response was truncated，既把「完成了但原因不认识」说成「没完成」，又白丢
+//     一轮回答（provider 若稳定返回 other 会重试到上限后整轮失败）。
 function toOpenAIFinishReason(finishReason) {
-  return finishReason === 'pause_turn' ? 'length' : finishReason;
+  if (finishReason === 'pause_turn') return 'length';
+  if (finishReason === 'upstream_error') return finishReason;
+  if (OPENAI_FINISH_REASONS.has(finishReason)) return finishReason;
+  log('warn', 'Unrecognized upstream finish reason', { reason: String(finishReason), mappedTo: 'stop' });
+  return 'stop';
 }
 
 // Generate a Claude-format fake signature for thinking blocks.
@@ -3044,8 +3270,12 @@ async function handleMessages(req, res) {
   const model = anthropicReq.model || 'claude-sonnet-4-6';
 
   // Convert Anthropic → OpenAI → CC
-  const openaiReq = convertAnthropicToOpenAI(anthropicReq);
+  let openaiReq = convertAnthropicToOpenAI(anthropicReq);
   const ccBody = buildCcRequest(openaiReq);
+  // issue #20：ccBody 已建好，原始请求树（anthropicReq）与中间树（openaiReq）都不再被引用，
+  // 显式断开以便尽早回收 —— 否则它们会和 ccBody 一起活到整段请求结束。
+  openaiReq = null;
+  anthropicReq = null;
 
   const abortController = new AbortController();
   let aborted = false;
@@ -3289,7 +3519,7 @@ async function handleMessages(req, res) {
               // 非流式路径会掉进 default 打成 'Unknown CC event type' —— 上游每个响应都会发，
               // 于是线上刷屏。它们本身不携带内容（内容在 text-delta），纯粹是噪音。
               case 'text-start': case 'text-end': case 'start': case 'start-step':
-              case 'reasoning-start': case 'reasoning-end': case 'finish-step':
+              case 'reasoning-start': case 'reasoning-end':
               case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
               case 'tool-error':
                 // Silent - no user-visible content
@@ -3436,6 +3666,21 @@ function responsesTextOf(content) {
   return content.map(p => (p && typeof p === 'object' ? (p.text || '') : '')).join('');
 }
 
+/** `input_image` 部件（含省略 type 只带 image_url 的写法）。 */
+function isResponsesImagePart(part) {
+  return !!part && typeof part === 'object' && (part.type === 'input_image' || part.image_url !== undefined);
+}
+
+/** Responses 的图 → Chat 的 `image_url` 部件（对象形的 image_url，CC 侧读 `.url`）。 */
+function responsesImagePartsOf(parts) {
+  if (!Array.isArray(parts)) return [];
+  return parts.filter(isResponsesImagePart).map(part => {
+    const raw = part.image_url !== undefined ? part.image_url : part.input_image;
+    const url = typeof raw === 'string' ? raw : (raw && raw.url) || '';
+    return url ? { type: 'image_url', image_url: { url } } : null;
+  }).filter(Boolean);
+}
+
 // data URL 图片：一段文本里超过这个长度的 data URL 就当成"图"，提出来单独发；小图留在文本里
 const INLINE_IMAGE_MIN = 256 * 1024;
 // 单张 data URL 上限：再大就不要了，只留一句占位说明（既撑爆上游窗口，也撑爆内存）
@@ -3553,6 +3798,22 @@ function convertResponsesToChat(respReq) {
   // Responses 把 reasoning / message / function_call 拆成并列 item，
   // Chat 要求它们挂在同一条 assistant 消息上，故先累积再冲刷。
   let pending = null;
+  // 并行 tool_call 的图片必须集中放在所有 tool_result 之后：CC/Anthropic 要求
+  // tool_result 紧跟 tool_use，若图片 user 消息插在多个 tool_result 之间，会打断
+  // 配对 —— 上游报 "Tool result is missing for tool call ..."。
+  // 单个 tool_call 带图时图片本就在序列末尾，不受影响；并行多个都带图时才触发。
+  let pendingToolImages = [];
+  const flushToolImages = () => {
+    if (!pendingToolImages.length) return;
+    messages.push({
+      role: 'user',
+      content: [
+        { type: 'text', text: '[images returned by tool calls]' },
+        ...pendingToolImages,
+      ],
+    });
+    pendingToolImages = [];
+  };
   const ensurePending = () => (pending = pending || { role: 'assistant', content: null, tool_calls: [] });
   const flushPending = () => {
     if (!pending) return;
@@ -3569,13 +3830,16 @@ function convertResponsesToChat(respReq) {
   } else if (Array.isArray(input)) {
     for (const item of input) {
       if (!item || typeof item !== 'object') continue;
+      const _itemType = item.type ?? (item.role ? 'message' : undefined);
+      // 非 function_call_output 的 item 打断了 tool_result 序列，先把累积的图片 flush
+      if (_itemType !== 'function_call_output') flushToolImages();
       // OpenAI 规范里 input 数组的联合类型第一个成员是 EasyInputMessage，它的
       // required 只有 role 与 content —— type 是可选的（官方文档与 SDK 示例普遍写作
       // { role: 'user', content: 'hi' }）。item.type 为 undefined 但有 role 时按
       // message 处理，否则这类 item 会落进 default 被丢弃：全部省略时只剩
       // "input is required" 的误导性报错；混合形态时更糟 —— 校验能过，用户在
       // HTTP 200 下静默丢消息。这里只在 type 缺失时兜底，带 type 的 item 判定不变。
-      switch (item.type ?? (item.role ? 'message' : undefined)) {
+      switch (_itemType) {
         case 'reasoning': {
           const t = responsesReasoningOf(item);
           if (t) ensurePending().reasoning_content = t;
@@ -3583,11 +3847,21 @@ function convertResponsesToChat(respReq) {
         }
         case 'message': {
           const text = responsesTextOf(item.content);
+          const images = responsesImagePartsOf(item.content);
           if (item.role === 'assistant') {
+            // assistant 消息上的图没有落点：Chat 的 assistant 内容只有文本槽
             if (text) ensurePending().content = text;
           } else if (item.role === 'system' || item.role === 'developer') {
             flushPending();
             messages.push({ role: 'system', content: text });
+          } else if (images.length) {
+            // 用户槽的图必须原样保留：CC 只收 user 角色上的图，丢掉时上游照样回 200，
+            // 客户端侧看不见任何异常（只表现为模型"没看到图"）。
+            flushPending();
+            messages.push({
+              role: 'user',
+              content: [...(text ? [{ type: 'text', text }] : []), ...images],
+            });
           } else {
             flushPending();
             messages.push({ role: 'user', content: text });
@@ -3612,17 +3886,14 @@ function convertResponsesToChat(respReq) {
           const { text, images } = splitToolOutput(item.output);
           messages.push({ role: 'tool', tool_call_id: item.call_id || '', content: text });
           if (images.length) {
-            log('info', 'Hoisted tool-output images to user message', {
-              count: images.length, bytes: images.reduce((a, u) => a + u.length, 0),
+            log('info', 'Deferred tool-output images (batched after tool results)', {
+              call_id: item.call_id, count: images.length, bytes: images.reduce((a, u) => a + u.length, 0),
             });
-            // content 走 image_url 形态，交给 buildCcRequest 里已验证的 user 图片分支转成 CC 的 {type:'image',image,mimeType}
-            messages.push({
-              role: 'user',
-              content: [
-                { type: 'text', text: '[image returned by tool call]' },
-                ...images.map(url => ({ type: 'image_url', image_url: { url }, _toolImage: true })),
-              ],
-            });
+            // 不立即 push：并行 tool_call 的图片统一累积，由 flushToolImages() 放到所有
+            // tool_result 之后。content 走 image_url 形态，交给 buildCcRequest 的 user 图片分支转换。
+            pendingToolImages.push(
+              ...images.map(url => ({ type: 'image_url', image_url: { url }, _toolImage: true })),
+            );
           }
           break;
         }
@@ -3634,6 +3905,7 @@ function convertResponsesToChat(respReq) {
     }
   }
   flushPending();
+  flushToolImages();
 
   // 统一裁剪工具截图（此时所有 item 都已转成 chat 形态，按顺序处理最直观）
   trimToolImages(messages);
@@ -3841,6 +4113,10 @@ function createResponsesSseTranslator(model, responseId, created) {
     // 这期间一个字节都不出网就会被中间层（实测 EdgeOne 源站 ~15s）或客户端首字节超时掐掉
     start: startResponse,
     get started() { return createdSent; },
+    // 是否真的产出过 output item（开过 item 或收尾过 item 都算）。
+    // #54 之后 created/in_progress 在收到 200 时就先行发出，started 恒为 true，
+    // 零输出防护不能再拿它当判据 —— 只能看「有没有实际内容」。
+    get hasOutput() { return outputIndex > 0 || doneItems.length > 0; },
     get stopReason() { return finishReason; },
     parseLine(line) {
       const trimmed = line.trim();
@@ -4023,7 +4299,9 @@ async function handleResponses(req, res) {
   };
   const ccBody = buildCcRequest(chatReq);
   const promptCacheKey = chatReq.prompt_cache_key;
+  // respReq 是 Codex/客户端送来的完整会话，比 chatReq 还大一份，及时释放避免内存驻留
   chatReq = null;
+  respReq = null;
 
   const abortController = new AbortController();
   let aborted = false;
@@ -4138,10 +4416,22 @@ async function handleResponses(req, res) {
             }
             const failed = translator.fail(translator.upstreamError.body.error.message);
             if (failed.length) await writeEvents(failed);
-          } else if (translator.outputTokens === 0 && !translator.started) {
+          } else if (translator.outputTokens === 0 && !translator.hasOutput) {
             try { if (!abortController.signal.aborted) abortController.abort(); } catch (e2) {}
-            sendResponsesError(res, 429, 'rate_limit_error',
-              'Empty response from upstream (zero output tokens)', 10);
+            if (!started) {
+              sendResponsesError(res, 429, 'rate_limit_error',
+                'Empty response from upstream (zero output tokens)', 10);
+              return;
+            }
+            // created 已随 200 先行发出，响应头按 200 提交后状态码改不回 429 ——
+            // 这里再调 sendResponsesError 会抛 ERR_HTTP_HEADERS_SENT（issue #56）。
+            // 按本文件既有失败口径走 response.failed：空响应绝不能经 finish() 包装成
+            // response.completed 谎报成功（与 #38/#39 修掉的静默截断同类）。
+            const failed = translator.fail('Empty response from upstream (zero output tokens)');
+            if (failed.length) await writeEvents(failed);
+            // 就地收尾：下面的 return 会跳过流式分支尾部的 res.end()，
+            // 漏掉这条客户端会挂在永不结束的 SSE 上。
+            if (!res.writableEnded) res.end();
             return;
           } else {
             if (!started) { res.writeHead(200, SSE_HEADERS); started = true; }
@@ -4243,7 +4533,7 @@ async function handleResponses(req, res) {
             //  provider-metadata / tool-input-* / tool-error）全部掉进 default 打成
             // 'Unknown CC event type'，线上刷屏、把真正的错误淹掉。
             case 'text-start': case 'text-end': case 'start': case 'start-step':
-            case 'reasoning-start': case 'reasoning-end': case 'finish-step':
+            case 'reasoning-start': case 'reasoning-end':
             case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
             case 'tool-error':
               // Silent - no user-visible content
@@ -4434,7 +4724,7 @@ server.listen(CFG.port, CFG.host, () => {
     url: `http://${CFG.host}:${CFG.port}`,
     api: CFG.apiBase,
     models: MODELS.length,
-    session: '12h + 1h jitter, per API key',
+    session: 'content-derived x-session-id',
     zdr: CFG.zdr ? 'enabled (x-cmd-zdr: 1 on generation/init requests)' : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
     emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on (space placeholder for requests without system prompt, issue #17)' : 'off',
     logFile: CFG.logFile || '(console only)',
@@ -4449,6 +4739,7 @@ server.listen(CFG.port, CFG.host, () => {
     keyPool: KEY_POOL.enabled
       ? `${KEY_POOL.entries.length} keys, sticky, switch at ${Math.round(KEY_POOL.switchAtRatio * 100)}%, probe every ${Math.round(KEY_POOL.probeIntervalMs / 60000)}min`
       : 'off',
+    fingerprint: `derived from API key (salt: ${CFG.fingerprintSalt ? 'set' : 'unset'})`,
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });

@@ -191,9 +191,11 @@ test('探测发现周额度达 95% → 冷却该 key，后续请求直接走另�
   }
 });
 
-test('同一会话落到不同 key 上用不同 threadId；同一 key 上保持稳定', async () => {  const t = await startPool({ generate: { [KEY_A]: QUOTA_400 } });
+test('同一会话落到不同 key 上用不同 threadId；同一 key 上保持稳定', async () => {
+  const t = await startPool({ generate: { [KEY_A]: QUOTA_400 } });
   try {
-    const session = 'sess-shared-1';
+    // 上游只接受合法 UUID 的 threadId，所以这里用 UUID 形式的 session
+    const session = '11111111-2222-4333-8444-555555555555';
     const body = { ...chatBody(), prompt_cache_key: session };
     const res1 = await t.proxy.post('/v1/chat/completions', body);
     assert.equal(res1.status, 200);
@@ -213,6 +215,12 @@ test('同一会话落到不同 key 上用不同 threadId；同一 key 上保持�
     assert.equal(res2.status, 200);
     const bodies = t.generateBodies();
     assert.equal(bodies[bodies.length - 1].threadId, salted(KEY_B));
+
+    // 非 UUID 的 session：上游 CLI 不会发这种 threadId，加盐也不应把它变成 UUID
+    const res3 = await t.proxy.post('/v1/chat/completions', { ...chatBody(), prompt_cache_key: 'not-a-uuid-session' });
+    assert.equal(res3.status, 200);
+    const bodies3 = t.generateBodies();
+    assert.equal('threadId' in bodies3[bodies3.length - 1], false);
   } finally {
     await t.close();
   }
