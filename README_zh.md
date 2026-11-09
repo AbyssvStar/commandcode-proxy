@@ -1,5 +1,191 @@
 # Command Code Proxy
 
+原项目：[MAXeaglet/commandcode-proxy: Command Code API 反代代理，兼容 OpenAI 与 Anthropic 接口](https://github.com/MAXeaglet/commandcode-proxy)
+
+本项目区别于原项目的核心能力：
+
+- **多账号自动接力**：把多把 `user_` key 放进 `keys.json`，代理自己挑一把用；当前这把额度用完/快用完时，自动换下一把。客户端（Codex、Claude Code、任意 OpenAI SDK）**完全不用改配置**。
+- **额度耗尽不再报错，而是自动换号**：上游把额度用完报成 400（`weekly usage limit reached` / `insufficient credits`），原项目会原样转给客户端，看起来像"请求写错了"，不会重试；现在会被识别成"这个账号没额度了"，在同一个请求内换下一把 key 重试，用户通常无感。
+- **提前换，不用等撞墙**：通过只读接口定期查周额度/5 小时额度，用量到 95%（可调）就提前把该账号冷却到窗口重置时间，避免请求打到一半才失败。
+- **全池耗尽时给出可行动的信息**：返回标准的 429 限流（带 `retry_after`，指向最早恢复时间），而不是一个含义不明的 400；客户端会按限流退避，而不是报"参数错误"。
+- **额度用多少一目了然**：`/admin/keys` 只读页面列出每把 key 的周/5h 用量、剩余额度、冷却原因和解冻时间——不用再挨个账号去查。
+- **切账号不串会话**：同一段对话落到不同账号时会用不同的会话标识，不会把 A 账号的上下文/缓存带到 B 账号。
+- **本仓库默认开启**：`config.json` 已带 `keyPool: { "mode": "pool" }`，填好 `keys.json` 后直接 `npm start` 就是池模式。想退回单 key：把 `mode` 改成 `off` 或删掉 `keyPool`，此时客户端仍需自己带真 key。
+
+## 适合谁
+
+- 手上有多个 Command Code 账号，想把周额度"拼"起来用的
+- 用 Codex / Claude Code 跑长会话，最怕中途因为额度断掉的
+- 想给别人分享一个统一入口、但不想把单账号额度给穿的人
+
+## 使用方法
+
+### 0. 前置条件
+
+- clone 本项目
+- Node.js >= 18，项目零依赖
+- 至少两把 `user_` 开头的 Command Code API key（只有一把也能跑，但该账号额度到阈值后就没有后备了）
+- 代理端口默认 `3050`（`config.json` 里的 `port`）
+
+### 1. 准备好keys.json文件
+
+`keys.json` 格式（参考仓库里的 `keys.example.json`）：
+
+```json
+[
+  { "key": "user_xxxxxxxx", "label": "主号" },
+  { "key": "user_yyyyyyyy", "label": "备号", "priority": 10 }
+]
+```
+
+- `label`：只出现在日志和管理视图里，方便辨认
+- `priority`：越小越先用，默认 `100`
+- 同一个 key 写两遍会被忽略；不是 `user_` 开头的 entry 会导致启动失败
+- 改完 `keys.json` 需要**重启代理**（只在启动时读取）
+
+### 2. 启动
+
+```bash
+npm start
+```
+
+### 3. 客户端接入
+
+#### Codex（`~/.codex/config.toml`）
+
+```toml
+# 已有需要修改
+model = "deepseek/deepseek-v4.1-flash"
+model_provider = "commandcode"
+preferred_auth_method = "apikey"
+forced_login_method = "api"
+
+# 需要添加
+[model_providers.commandcode]
+name = "Command Code"
+base_url = "http://127.0.0.1:3050/v1"
+wire_api = "responses"
+experimental_bearer_token = "user_pool"   # 占位即可，池模式会忽略它
+```
+
+#### 任意 OpenAI 兼容客户端
+
+```bash
+curl http://127.0.0.1:3050/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}'
+```
+
+不用带 `Authorization`；带了也会被忽略。
+
+#### Anthropic 客户端
+
+指向 `http://127.0.0.1:3050`，`x-api-key` 同样可填任意值。
+
+## 其他功能
+
+### 如果想要关掉密钥池模式
+
+删掉`config.json` 里的 `"keyPool": { "mode": "pool" }`一行（或把`pool`改为`off`）即可，会自动退回单密钥的模式，需要填客户端的apikey
+
+### keypool参数
+
+`config.json` 里的 `keyPool`示例（一般只需要填mode即可，其他参数作用见下表）：
+
+```
+{
+  "port": 3050,
+  "host": "0.0.0.0",
+  "apiKey": "",
+  "apiBase": "https://api.commandcode.ai",
+  "projectSlug": "cc-proxy",
+  "keyPool": {
+    "mode": "pool",
+    "file": "keys.json",
+    "stateFile": "keys.state.json",
+    "switchAtRatio": 0.95,
+    "probeIntervalMs": 600000,
+    "maxAttempts": 3,
+    "adminToken": "换成一串足够长的随机字符"
+  }
+}
+```
+
+字段说明：
+
+| 字段              | 默认              | 作用                                    |
+| ----------------- | ----------------- | --------------------------------------- |
+| `mode`            | `off`（本仓库 `config.json` 为 `pool`） | 只有 `pool` 才启用                      |
+| `file`            | `keys.json`       | key 列表路径（相对 `proxy.mjs`）        |
+| `stateFile`       | `keys.state.json` | 状态文件路径                            |
+| `switchAtRatio`   | `0.95`            | 周/5h 用量达到该比例就提前冷却（0.5~1） |
+| `probeIntervalMs` | `600000`          | 额度探测间隔（10 分钟，最小 500）       |
+| `maxAttempts`     | `3`               | 单个请求最多换几次 key（1~5）           |
+| `adminToken`      | `""`              | 留空 = 不开放 `/admin/keys`             |
+
+也可以用环境变量覆盖（优先级高于 `config.json`）：`CC_KEY_POOL_MODE`、`CC_KEY_POOL_FILE`、`CC_KEY_POOL_STATE`、`CC_KEY_POOL_ADMIN_TOKEN`。
+
+### 看额度和管理状态
+
+```bash
+curl -H "x-admin-token: 你的token" http://127.0.0.1:3050/admin/keys
+```
+
+返回每把 key 的：
+
+- `label` / `id`（hash 前 8 位，不是明文）
+- `coolingDown`、`cooldownReason`（`weekly_limit` / `five_hour_limit` / `credits_exhausted` / `auth_failed`）、`cooldownUntilLocal`
+- `weekly` / `fiveHour` 的 `used`、`cap`、`ratio`、`resetAtLocal`
+- `remainingCredits`、`lastProbeAtLocal`、`inflight`
+
+这只是只读视图；没配 `adminToken` 时该路由返回 404。建议用请求头传 token，`?token=` 会进访问日志。
+
+### 它什么时候换 key
+
+| 情况                  | 行为                                                         |
+| --------------------- | ------------------------------------------------------------ |
+| 周/5h 用量到 95%      | 探测发现后冷却到该窗口重置时间，下一个请求换下一把           |
+| 剩余额度见底          | 冷却 3 小时                                                  |
+| 上游报额度耗尽（400） | 改写为 429 `insufficient_quota`；还没向客户端输出内容时，**同一请求内**换 key 重试 |
+| 401 / 403             | 同请求内换 key；同一把连续两次才禁用（内存态，重启恢复）     |
+| 已经开始输出内容      | 不换 key（避免重复/截断），只标记该 key，让客户端重试        |
+| 全部 key 都不可用     | 返回 429 `insufficient_quota`，`retry_after` 指向最早恢复时间（封顶 300 秒） |
+
+冷却到期后会重新参与选择，不需要手动清状态。
+
+### Docker 用法
+
+`keys.json` 不进镜像，先本地构建再挂载：
+
+```bash
+docker build -t commandcode-proxy .
+
+docker run -d --name cc-proxy -p 3050:3050 \
+  -e CC_KEY_POOL_MODE=pool \
+  -e CC_KEY_POOL_ADMIN_TOKEN=your-long-random-token \
+  -v "$PWD/keys.json:/app/keys.json:ro" \
+  -v "$PWD/state:/app/state" \
+  commandcode-proxy
+```
+
+同时把 `config.json` 里的 `stateFile` 指到挂载目录（例如 `state/keys.state.json`），否则容器重建会丢冷却状态。多实例部署**不要**共享同一个 state 文件。
+
+## 需要如实告知的限制
+
+- 已经开始向客户端输出内容的请求不会中途换 key（会重复/截断），只会标记该账号；客户端重试时会自动落到下一把——所以偶发一次重试是正常的。
+- 周额度/5h 的重置时间由上游决定，代理只是读取；探测接口不是官方文档化接口，字段变化时只告警、不做猜测。
+- 同一出口 IP 挂多个账号仍然是上游可观测的信号；代理已经为每个账号派生独立的设备指纹，但这属于机制上限，不承诺"绝对不被风控"。
+- 多实例部署不要共享同一个状态文件。
+
+## 安全提醒
+
+- `keys.json` 和 `keys.state.json` 已在 `.gitignore` 里，别手动提交；state 文件只有 hash，没有明文 key
+- `adminToken` 用长随机值；不要把管理端口暴露到公网
+- 同一出口 IP 挂多个账号仍是上游可观测信号，代理只做了按 key 隔离设备指纹，不承诺规避风控
+- 探测接口不是官方文档化接口，字段变化时代理只告警、不改判定逻辑
+
+# 原项目 README（包括本项目的修改）
+
 > [English Docs](README.md)
 
 将 Command Code API 转换为 OpenAI / Anthropic 兼容接口的反代代理。单文件，零外部依赖。

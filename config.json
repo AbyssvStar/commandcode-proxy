@@ -11,5 +11,6 @@
   "fingerprintSalt": "",
   "deviceProjectDir": "",
   "cliMode": "agent",
-  "cliSessionMode": "interactive"
+  "cliSessionMode": "interactive",
+  "keyPool": { "mode": "pool" }
 }

@@ -1,6 +1,193 @@
 # Command Code Proxy
 
+Original project: [MAXeaglet/commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy)
+
 > [中文文档](README_zh.md)
+
+What this fork adds over the original project:
+
+- **Automatic multi-account rotation**: put several `user_` keys into `keys.json`; the proxy picks one and moves to the next when the current account runs (or is about to run) out. Clients (Codex, Claude Code, any OpenAI SDK) keep the same config when keys change.
+- **Exhaustion becomes a key switch, not an error**: the upstream reports "out of quota" as HTTP 400 (`weekly usage limit reached` / `insufficient credits`). The original passes that through, so it looks like a malformed request and is not retried. This fork recognizes it as "this account is out of quota" and retries the same request on the next key — usually invisible to the user.
+- **Switch before hitting the wall**: a read-only probe checks the weekly / 5-hour windows periodically; at 95% (configurable) the account is cooled down until the window resets, instead of failing mid-request.
+- **Actionable state when the whole pool is out**: a standard 429 with `retry_after` pointing at the earliest recovery time, instead of an opaque 400. Clients back off instead of failing as a bad request.
+- **Quota at a glance**: `/admin/keys` lists each key's weekly/5-hour usage, remaining credits, cooldown reason and release time.
+- **No cross-account conversation leakage**: the same conversation gets a different thread identity on a different account, so A's context/cache never follows you to B.
+- **On by default in this repo**: `config.json` ships `keyPool: { "mode": "pool" }`, so after creating `keys.json`, `npm start` runs in pool mode. To go back to a single key, set `mode` to `off` (or remove `keyPool`) — clients must then carry a real key again.
+
+## Who it's for
+
+- People with several Command Code accounts who want to combine their weekly quotas
+- Long Codex / Claude Code sessions that should not die mid-way on quota
+- Anyone sharing one endpoint without giving away a single account's quota
+
+## Usage
+
+### 0. Prerequisites
+
+- Clone this repo
+- Node.js >= 18, zero dependencies
+- At least two `user_`-prefixed Command Code API keys (one works, but leaves no backup once it hits the threshold)
+- Create `keys.json` before starting: this repo's `config.json` enables the pool by default, and a missing key file is a fatal startup error
+- The proxy listens on `3050` by default (`port` in `config.json`)
+
+### 1. Create `keys.json`
+
+```json
+[
+  { "key": "user_xxxxxxxx", "label": "main" },
+  { "key": "user_yyyyyyyy", "label": "backup", "priority": 10 }
+]
+```
+
+- `label` only appears in logs and the admin view
+- `priority`: lower is preferred, default `100`
+- Duplicate keys are ignored; an entry that is not a `user_` key aborts startup
+- Restart the proxy after editing `keys.json` (it is read once at startup)
+
+### 2. Start
+
+```bash
+npm start
+```
+
+The startup banner should show e.g. `keyPool: 2 keys, sticky, switch at 95%, probe every 10min`.
+
+### 3. Connect clients
+
+#### Codex (`~/.codex/config.toml`)
+
+```toml
+# existing, may need adjusting
+model = "deepseek/deepseek-v4.1-flash"
+model_provider = "commandcode"
+preferred_auth_method = "apikey"
+forced_login_method = "api"
+
+# add this
+[model_providers.commandcode]
+name = "Command Code"
+base_url = "http://127.0.0.1:3050/v1"
+wire_api = "responses"
+experimental_bearer_token = "user_pool"   # placeholder; pool mode ignores it
+```
+
+Pool mode ignores the incoming key, so `experimental_bearer_token` can be any non-empty value.
+
+#### Any OpenAI-compatible client
+
+```bash
+curl http://127.0.0.1:3050/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}'
+```
+
+No `Authorization` header is needed; it is ignored if present.
+
+#### Anthropic clients
+
+Point the base URL at `http://127.0.0.1:3050`; `x-api-key` is likewise ignored.
+
+## Other features
+
+### Turning the pool off
+
+Set `"mode": "off"` or remove `keyPool` from `config.json` and restart. The proxy falls back to single-key mode and clients must carry a real key again.
+
+### keyPool options
+
+```json
+{
+  "port": 3050,
+  "host": "0.0.0.0",
+  "apiKey": "",
+  "apiBase": "https://api.commandcode.ai",
+  "projectSlug": "cc-proxy",
+  "keyPool": {
+    "mode": "pool",
+    "file": "keys.json",
+    "stateFile": "keys.state.json",
+    "switchAtRatio": 0.95,
+    "probeIntervalMs": 600000,
+    "maxAttempts": 3,
+    "adminToken": "use-a-long-random-string"
+  }
+}
+```
+
+| Field | Default | Purpose |
+|---|---|---|
+| `mode` | `off` (this repo's `config.json` uses `pool`) | Only `pool` enables the feature |
+| `file` | `keys.json` | Key list path, relative to `proxy.mjs` |
+| `stateFile` | `keys.state.json` | State file path |
+| `switchAtRatio` | `0.95` | Cool down early once a window reaches this ratio (0.5–1) |
+| `probeIntervalMs` | `600000` | Probe interval, 10 minutes (minimum 500) |
+| `maxAttempts` | `3` | Max keys tried per request (1–5) |
+| `adminToken` | `""` | Empty = `/admin/keys` is not exposed |
+
+Environment overrides (higher priority than `config.json`): `CC_KEY_POOL_MODE`, `CC_KEY_POOL_FILE`, `CC_KEY_POOL_STATE`, `CC_KEY_POOL_ADMIN_TOKEN`.
+
+### Quota and status
+
+```bash
+curl -H "x-admin-token: your-token" http://127.0.0.1:3050/admin/keys
+```
+
+Each key reports:
+
+- `label` / `id` (first 8 hex chars of a hash, never the key)
+- `coolingDown`, `cooldownReason` (`weekly_limit` / `five_hour_limit` / `credits_exhausted` / `auth_failed`), `cooldownUntilLocal`
+- `weekly` / `fiveHour` with `used`, `cap`, `ratio`, `resetAtLocal`
+- `remainingCredits`, `lastProbeAtLocal`, `inflight`
+
+Read-only view; without `adminToken` the route returns 404. Prefer the header over `?token=`, which ends up in access logs.
+
+### When a key is switched
+
+| Situation | Behavior |
+|---|---|
+| Weekly / 5-hour usage reaches 95% | Probe cools the account down until the window resets; the next request moves on |
+| Credit balance exhausted | Cool-down for 3 hours |
+| Upstream reports quota exhaustion (400) | Rewritten to 429 `insufficient_quota`; if nothing has been written to the client yet, the **same request** is retried on the next key |
+| 401 / 403 | Retried on the next key in the same request; a key is disabled after two consecutive failures (in memory, resets on restart) |
+| Streaming already started | No switch (would duplicate/truncate); the key is marked and the client retries |
+| All keys unavailable | 429 `insufficient_quota` with `retry_after` (earliest recovery, capped at 300 s) |
+
+Cooldowns expire on their own; no manual state cleanup needed.
+
+### Docker
+
+`keys.json` is not baked into the image; build locally and mount it:
+
+```bash
+docker build -t commandcode-proxy .
+
+docker run -d --name cc-proxy -p 3050:3050 \
+  -e CC_KEY_POOL_MODE=pool \
+  -e CC_KEY_POOL_ADMIN_TOKEN=your-long-random-token \
+  -v "$PWD/keys.json:/app/keys.json:ro" \
+  -v "$PWD/state:/app/state" \
+  commandcode-proxy
+```
+
+> The original project's GHCR image belongs to the `MAXeaglet` repo and does not contain this fork's key-pool code; build from source instead.
+
+Also point `stateFile` in `config.json` at the mounted directory (e.g. `state/keys.state.json`), otherwise cooldown state is lost when the container is recreated. Do **not** share one state file between multiple instances.
+
+## Honest limitations
+
+- A request that has already started streaming never switches keys (that would duplicate or truncate output); the account is only marked, and the client's retry lands on the next key — so an occasional retry is expected.
+- Weekly/5-hour reset times come from upstream; the proxy only reads them. The probe endpoint is undocumented, so field changes only produce warnings, never guesses.
+- Several accounts behind one egress IP remain observable upstream. The proxy derives a separate device fingerprint per account, but that is a mechanism limit, not a guarantee against risk control.
+- Do not share one state file across multiple instances.
+
+## Security notes
+
+- `keys.json` and `keys.state.json` are gitignored; never commit them. The state file stores only hashes, no plaintext keys.
+- Use a long random `adminToken`; do not expose the admin route to the public internet.
+- Multiple accounts on one egress IP stay observable upstream; the proxy only isolates fingerprints per key and does not claim to evade risk control.
+- The probe endpoint is undocumented; field changes only trigger warnings and never change quota decisions by guesswork.
+
+# Original README (modified)
 
 A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible endpoints. Single file, zero external dependencies.
 
